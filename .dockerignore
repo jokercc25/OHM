@@ -1,0 +1,33 @@
+# VCS
+.git
+.gitignore
+
+# Python artifacts
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+
+# Secrets & runtime state — MUST stay out of the image (mounted at runtime)
+.ohmo
+.openharness
+.pip-cache
+.env
+
+# Editor / OS
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Frontend node deps (not needed to build the wheel)
+frontend/terminal/node_modules
+
+# Misc
+*.log

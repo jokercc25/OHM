@@ -1,0 +1,20 @@
+services:
+  gateway:
+    build: .
+    image: openharness-gateway:latest
+    container_name: kishirika-gateway
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      OHMO_WORKSPACE: /workspace
+      OPENHARNESS_CONFIG_DIR: /config
+    volumes:
+      # 奇希莉卡的配置 + 人设 + 记忆 + 会话（含密钥，本地已存在，直接挂载）
+      - ./.ohmo:/workspace
+      # OpenHarness 模型配置 + DeepSeek 密钥
+      - ./.openharness:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
