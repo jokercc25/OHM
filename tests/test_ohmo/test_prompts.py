@@ -35,6 +35,8 @@ def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
     assert "Ask a few high-value questions." in prompt
     assert "timezone.md" in prompt
     assert "UTC timestamps" in prompt
+    assert "屎库" in prompt
+    assert "ohmo_save_gossip" in prompt
 
 
 def test_ohmo_runtime_prompt_can_exclude_project_memory(tmp_path: Path, monkeypatch):

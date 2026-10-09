@@ -7,6 +7,7 @@ from pathlib import Path
 from openharness.memory import load_memory_prompt as load_project_memory_prompt
 from openharness.prompts.system_prompt import get_base_system_prompt
 
+from ohmo.gossip import load_gossip_prompt
 from ohmo.memory import load_memory_prompt as load_ohmo_memory_prompt
 from ohmo.workspace import (
     get_bootstrap_path,
@@ -65,6 +66,13 @@ def build_ohmo_system_prompt(
 
     if ohmo_memory := load_ohmo_memory_prompt(root):
         sections.append(ohmo_memory)
+
+    # Rendered for every session, not just QQ: the gossip tool is registered
+    # unconditionally, so a session that was told about the tool but not how to
+    # use it would be the worse failure. The tool itself refuses to run outside
+    # a QQ group.
+    if gossip := load_gossip_prompt(root):
+        sections.append(gossip)
 
     if include_project_memory:
         project_memory = load_project_memory_prompt(cwd)

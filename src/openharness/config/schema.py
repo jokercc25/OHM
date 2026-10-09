@@ -29,6 +29,13 @@ class BaseChannelConfig(_CompatModel):
     # remote sender. Operators must explicitly allow specific identities, or
     # intentionally set ["*"] when they want open access.
     allow_from: list[str] = Field(default_factory=list)
+    # Per-channel override of ChannelConfigs.send_progress / send_tool_hints.
+    # None means "inherit the container-wide setting". QQ needs this because its
+    # passive reply budget is 5 messages per msg_id, shared by the progress
+    # stream and the real answer -- a channel that can only speak a handful of
+    # times per turn must be able to opt out without silencing every other one.
+    send_progress: bool | None = None
+    send_tool_hints: bool | None = None
 
 
 class TelegramConfig(BaseChannelConfig):

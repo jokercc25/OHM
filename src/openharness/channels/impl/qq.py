@@ -5,14 +5,24 @@ import json
 import logging
 import os
 import re
+import time
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
+
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
-from openharness.channels.impl.base import BaseChannel
-from openharness.channels.impl.qq_rich import census, flatten_group_payload
+from openharness.channels.impl.base import BaseChannel, resolve_channel_media_dir
+from openharness.channels.impl.qq_rich import (
+    MediaRef,
+    census,
+    flatten_group_payload,
+    rewrite_media_links,
+    safe_attachment_name,
+    split_transcript,
+)
 from openharness.config.schema import QQConfig
 from openharness.utils.fs import atomic_write_text
 
@@ -46,6 +56,13 @@ _DEBUG_PAYLOAD_DIRNAME = "qq-payload"
 _CONNECT_TIMEOUT_SECONDS = 15 * 60
 _RECONNECT_BASE_SECONDS = 5
 _RECONNECT_MAX_SECONDS = 300
+
+# Attachment download bounds. QQ hands out rkey-signed media URLs that expire
+# within minutes, so the only chance to keep an image is to fetch it during the
+# event that carried it.
+MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_IMAGES_PER_MESSAGE = 6
 
 
 def _install_botpy_payload_hook() -> None:
@@ -156,6 +173,9 @@ class QQChannel(BaseChannel):
         self._group_openids: set[str] = set()
         # Last msg_id seen per group, required for passive group replies.
         self._group_msg_ids: dict[str, str] = {}
+        # Created on first use so a channel that never sees an image never opens
+        # a connection pool; closed in stop().
+        self._http: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
         """Start the QQ bot."""
@@ -179,15 +199,31 @@ class QQChannel(BaseChannel):
         """Run the bot connection with auto-reconnect and backoff."""
         backoff = _RECONNECT_BASE_SECONDS
         while self._running:
+            started = time.monotonic()
             try:
                 await asyncio.wait_for(
                     self._client.start(appid=self.config.app_id, secret=self.config.app_secret),
                     timeout=_CONNECT_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                # botpy can wedge without raising; without this bound the process
-                # never exits and `restart: unless-stopped` never fires.
-                logger.error("QQ bot connection wedged for %ss, forcing reconnect", _CONNECT_TIMEOUT_SECONDS)
+                # Since Python 3.11 asyncio.TimeoutError *is* the builtin
+                # TimeoutError, so botpy's own internal timeouts land here too.
+                # Measuring elapsed time is what separates "our bound fired" from
+                # "the SDK gave up quickly" -- without it every SDK timeout got
+                # reported as a 15-minute wedge, which sent us hunting for a hang
+                # that was never there.
+                elapsed = time.monotonic() - started
+                if elapsed >= _CONNECT_TIMEOUT_SECONDS * 0.9:
+                    # botpy can wedge without raising; without this bound the
+                    # process never exits and `restart: unless-stopped` never fires.
+                    logger.error(
+                        "QQ bot connection wedged for %.0fs, forcing reconnect", elapsed
+                    )
+                else:
+                    logger.warning(
+                        "QQ bot connection timed out after %.0fs (inside the SDK), reconnecting",
+                        elapsed,
+                    )
             except Exception as e:
                 logger.warning("QQ bot error: %s", e)
             else:
@@ -205,6 +241,12 @@ class QQChannel(BaseChannel):
                 await self._client.close()
             except Exception:
                 pass
+        if self._http is not None:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
         logger.info("QQ bot stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
@@ -236,6 +278,51 @@ class QQChannel(BaseChannel):
                 )
         except Exception as e:
             logger.error("Error sending QQ message: %s", e)
+
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                timeout=MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+                follow_redirects=True,
+            )
+        return self._http
+
+    async def _download_media(self, message_id: str, refs: tuple[MediaRef, ...]) -> dict[str, str]:
+        """Fetch this message's images; return the URL -> local path map.
+
+        QQ's media URLs carry a short-lived ``rkey``, so these must be fetched
+        now or never -- the URL is deliberately never persisted. Every failure
+        is swallowed into a log line: a member forwarding an image must not
+        lose the rest of the message because the CDN was slow.
+        """
+        if not refs:
+            return {}
+        media_dir = resolve_channel_media_dir(self.name)
+        saved: dict[str, str] = {}
+        for index, ref in enumerate(refs[:MAX_IMAGES_PER_MESSAGE], start=1):
+            target = media_dir / safe_attachment_name(message_id, index, ref.filename)
+            try:
+                response = await self._http_client().get(ref.url)
+                response.raise_for_status()
+                if len(response.content) > MAX_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "QQ attachment over the size cap, skipped bytes=%s message_id=%s",
+                        len(response.content),
+                        message_id,
+                    )
+                    continue
+                target.write_bytes(response.content)
+                saved[ref.url] = str(target)
+            except Exception as e:
+                logger.warning("QQ attachment download failed message_id=%s error=%s", message_id, e)
+        if len(refs) > MAX_IMAGES_PER_MESSAGE:
+            logger.warning(
+                "QQ message carried %s images, only the first %s were kept message_id=%s",
+                len(refs),
+                MAX_IMAGES_PER_MESSAGE,
+                message_id,
+            )
+        return saved
 
     async def _on_message(self, data: "C2CMessage") -> None:
         """Handle incoming C2C (private) message from QQ."""
@@ -298,12 +385,29 @@ class QQChannel(BaseChannel):
                 or "unknown"
             )
 
-            content = (data.content or "").strip()
-            if not content:
+            # The @-message carries two things: what the sender typed, and QQ's
+            # transcript of the recent messages. A forwarded card arrives in the
+            # transcript, so an empty `content` must NOT be treated as an empty
+            # message -- that was dropping exactly the messages we want.
+            typed = _AT_MENTION_RE.sub("", (data.content or "").strip(), count=1).strip()
+            transcript = rich.text
+            if not typed and not transcript:
                 return
-            content = _AT_MENTION_RE.sub("", content, count=1).strip()
-            if not content:
-                return
+
+            # Must happen here, in the event that carried the message: the URLs
+            # are rkey-signed and stop working within minutes. The transcript is
+            # rewritten in place so what reaches the archive -- and the model --
+            # points at a file instead of a link that is already expiring.
+            saved = await self._download_media(message_id, rich.media)
+            media_paths = list(saved.values())
+            if rich.media:
+                transcript = rewrite_media_links(transcript, saved)
+
+            content = f"{typed}\n\n{transcript}" if typed and transcript else (typed or transcript)
+            # Segments are re-split from the *rewritten* transcript: the gossip
+            # tool archives a segment verbatim, so a stale rkey URL reaching
+            # `metadata["qq_segments"]` would be written straight into the store.
+            segments = split_transcript(transcript)
 
             # Remember this chat as a group so send() routes to post_group_message,
             # and stash the message id so passive group replies can echo msg_id.
@@ -333,6 +437,14 @@ class QQChannel(BaseChannel):
                 metadata["qq_timestamp"] = raw.get("timestamp")
                 metadata["qq_message_ids"] = list(rich.message_ids)
                 metadata["qq_payload"] = rich.raw
+            if segments:
+                # Verbatim section bodies, keyed by QQ's own numbering, so the
+                # gossip tool can archive one of them without the model ever
+                # supplying the text.
+                metadata["qq_segments"] = [
+                    {"index": segment.index, "content": segment.content}
+                    for segment in segments
+                ]
 
             # Pipe-join group + member so allow_from can match either the whole
             # group (group_openid) or a specific member (member_openid).
@@ -340,6 +452,7 @@ class QQChannel(BaseChannel):
                 sender_id=f"{group_openid}|{member_id}",
                 chat_id=group_openid,
                 content=content,
+                media=media_paths,
                 metadata=metadata,
             )
         except Exception:

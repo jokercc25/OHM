@@ -1,59 +1,101 @@
-"""Flatten rich QQ group payloads into text plus downloadable attachments.
+"""Flatten QQ group payloads into text plus downloadable attachments.
 
 This module is deliberately free of any ``botpy`` import so it can be unit
 tested without the SDK installed. :mod:`openharness.channels.impl.qq` feeds it
 the raw event payload (``payload["d"]``) and handles all IO.
 
-The QQ element shapes below follow the official group-message documentation but
-are **not yet confirmed against a live payload**. :func:`census` exists to
-settle that: run one @-mention per message kind and read the census line. Until
-then, unknown element types degrade to an explicit marker rather than being
-silently dropped.
+MEASURED SHAPE
+--------------
+Verified against live payloads on 2026-10-09 (qq-botpy 1.2.1 plus the
+raw-payload hook in ``qq.py``). Every point below contradicts what the QQ
+documentation implies, which is exactly why the flattening was held back until
+a real capture existed:
+
+1. ``msg_elements`` is a list holding **exactly one** element. It has no
+   ``message_type`` and no ``author``. Its ``content`` is a plain-text
+   transcript **QQ already produced for us**::
+
+       === 消息 1 ===
+       [消息内容] 唐完了
+
+       === 消息 2 ===
+       [消息内容] [群聊的聊天记录]
+       [消息类型] 合并转发消息
+       [关联消息]
+       --- 第1条 ---
+           [消息内容] 什么时候来着
+           [发送者] 旺旺雪饼
+
+   Merged-forward records therefore arrive pre-flattened with sender labels
+   included, and image attachments arrive as inline text lines. There is no
+   ``ark_data`` to walk and no element tree to recurse.
+
+   This matters because the official bot only receives a group message when it
+   is @-mentioned, so a forwarded card is never delivered as its own event --
+   the transcript is the *only* channel by which it reaches us.
+
+2. ``message_scene.ext`` is a list of three **credential** strings
+   (``msg_idx=…``, ``auth_token=…``, ``ref_msg_idx=…``) used to reply with a
+   quote. It is *not* the recent-message list, and carries nothing archivable.
+
+3. Image URLs embed a short-lived ``rkey``. They must be fetched immediately
+   and never persisted; the dump and the archive sidecar both carry the
+   redacted form.
+
+4. Transcripts are not guaranteed. A bare @-mention can arrive with
+   ``msg_elements: null``, so every consumer must tolerate an empty result.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from openharness.utils.helpers import safe_filename
 
-# QQ msg_elements[].message_type values we know how to render. Anything else is
-# surfaced as a marker so the Phase-0 census can tell us what we are missing.
-MSG_TYPE_TEXT = 0
-MSG_TYPE_RICH = 1
-MSG_TYPE_MARKDOWN = 2
-MSG_TYPE_ARK = 3
-MSG_TYPE_EMBED = 4
-MSG_TYPE_MEDIA = 7
-MSG_TYPE_CHAT_RECORD = 102
-MSG_TYPE_QUOTE = 103
+# ``=== 消息 N ===`` section header emitted once per message in a transcript.
+_SECTION_RE = re.compile(r"^===\s*消息\s*(\d+)\s*===\s*$", re.MULTILINE)
 
-# Keys that carry short-lived credentials or server bookkeeping. QQ media URLs
-# embed an rkey that expires, so they must never be persisted (download now).
+# Inline attachment line, e.g.
+#   [附件1] 类型:图片 文件名:a.jpg 尺寸:261x264 大小:8.8KB URL:https://…&rkey=…
+# QQ serves images from /download with no file extension, so the 类型 marker --
+# not the URL -- is the only reliable signal that a line is an image.
+_ATTACHMENT_LINE_RE = re.compile(r"\[附件\d+\]")
+_FILENAME_RE = re.compile(r"文件名[:：]\s*(\S+)")
+_URL_RE = re.compile(r"URL[:：]\s*(\S+)")
+
+# Keys carrying short-lived credentials or server bookkeeping.
 _SENSITIVE_KEYS = frozenset({"auth_token", "authToken", "msg_idx", "ref_msg_idx", "token"})
 _RKEY_RE = re.compile(r"(rkey=)[^&\s\"']+")
 _UNSAFE_STEM_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 _REDACTED = "<redacted>"
 
-_MAX_ELEMENT_DEPTH = 2
-_MAX_ELEMENTS = 20
+# Bounds, so a pathological payload cannot blow up the prompt.
+_MAX_TRANSCRIPT_CHARS = 8000
+_MAX_SEGMENTS = 20
 
-# Best-effort field priority for Ark / embed cards. 小黑盒 lands in tuwen/feed
-# and carries title + desc + jump_url; jump_url is the highest-value field.
-_CARD_FIELD_PRIORITY = (
-    "title",
-    "desc",
-    "description",
-    "jump_url",
-    "url",
-    "source",
-    "tag",
-    "nickname",
-)
+
+@dataclass(frozen=True)
+class MediaRef:
+    """A downloadable image referenced inline by a transcript."""
+
+    url: str
+    filename: str = ""
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    """One ``=== 消息 N ===`` section of a QQ transcript."""
+
+    index: int
+    """The ``N`` from the section header, as QQ numbered it."""
+
+    content: str
+    """The section body, verbatim. This is the archival original: it must reach
+    the archive untouched, never through a model paraphrase."""
 
 
 @dataclass(frozen=True)
@@ -61,26 +103,30 @@ class RichContent:
     """Result of flattening one QQ group payload."""
 
     text: str
-    """Markdown transcript to append to the inbound message content."""
+    """QQ's transcript, to be appended to the inbound message content."""
 
-    media_urls: tuple[str, ...] = ()
-    """Remote attachment URLs to download. This module never performs IO."""
+    segments: tuple[TranscriptSegment, ...] = ()
+    """The transcript split by section, so a caller can name one verbatim."""
+
+    media: tuple[MediaRef, ...] = ()
+    """Inline images found in the transcript. This module never performs IO."""
 
     message_ids: tuple[str, ...] = ()
-    """Every QQ message id seen (outer id plus each element's), for dedup."""
-
-    attachments: tuple[dict[str, Any], ...] = ()
-    """Normalised attachment metadata for logging and the sidecar."""
+    """QQ message ids seen, for dedup across re-forwards."""
 
     has_rich: bool = False
-    """True when cards/elements/attachments were flattened."""
+    """True when a transcript was present."""
 
     raw: dict[str, Any] | None = None
-    """Redacted payload, for the optional sidecar file."""
+    """Redacted payload, for the optional dump and archive sidecar."""
+
+    @property
+    def media_urls(self) -> tuple[str, ...]:
+        return tuple(ref.url for ref in self.media)
 
     @property
     def is_empty(self) -> bool:
-        return not self.text and not self.media_urls
+        return not self.text and not self.media
 
 
 def redact_payload(value: Any) -> Any:
@@ -96,7 +142,7 @@ def redact_payload(value: Any) -> Any:
         return redacted
     if isinstance(value, str):
         return _RKEY_RE.sub(r"\1" + _REDACTED, value)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, (list, tuple)):
         return [redact_payload(item) for item in value]
     return value
 
@@ -105,150 +151,75 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
-def _text_of(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, Mapping):
-        for key in ("content", "text", "desc", "title"):
-            found = value.get(key)
-            if isinstance(found, str) and found.strip():
-                return found.strip()
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _transcript_of(raw: Mapping[str, Any]) -> str:
+    """Return QQ's plain-text transcript for this event, or ``""``."""
+    elements = raw.get("msg_elements")
+    if not isinstance(elements, list):
+        return ""
+    for element in elements:
+        content = _as_mapping(element).get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()[:_MAX_TRANSCRIPT_CHARS]
     return ""
 
 
-def _sender_label(element: Mapping[str, Any]) -> str:
-    author = _as_mapping(element.get("author"))
-    for key in ("username", "nickname", "member_openid", "id"):
-        found = author.get(key)
-        if isinstance(found, str) and found.strip():
-            return found.strip()
-    return "?"
+def split_transcript(text: str) -> tuple[TranscriptSegment, ...]:
+    """Split a QQ transcript into its ``=== 消息 N ===`` sections.
 
+    Bodies are returned verbatim so the archive can quote them word for word.
+    A transcript with no section markers yields no segments rather than one
+    giant one -- callers treat "no segments" as "nothing was quoted".
+    """
+    if not text:
+        return ()
+    matches = list(_SECTION_RE.finditer(text))
+    if not matches:
+        return ()
 
-def _render_card(element: Mapping[str, Any]) -> str:
-    """Render an Ark / embed card down to title, summary and URL."""
-    ark = _as_mapping(element.get("ark_data") or element.get("ark"))
-    name = str(ark.get("ark_name") or ark.get("template_name") or "").strip()
-    fields: dict[str, Any] = {}
-    for container in (ark, element):
-        for key, item in _as_mapping(container).items():
-            fields.setdefault(str(key), item)
-    kv = _as_mapping(ark.get("kv")) or _as_mapping(ark.get("fields"))
-    for key, item in kv.items():
-        fields.setdefault(str(key), item)
-
-    lines = [f"[链接卡片{': ' + name if name else ''}]"]
-    for key in _CARD_FIELD_PRIORITY:
-        found = _text_of(fields.get(key))
-        if found:
-            lines.append(f"{key}: {found}")
-    if len(lines) == 1:
-        lines.append(f"[卡片字段未识别: {sorted(fields)[:8]}]")
-    return "\n".join(lines)
-
-
-def _render_chat_record(element: Mapping[str, Any], depth: int) -> str:
-    """Render a forwarded chat record as a quoted transcript."""
-    lines = ["[转发聊天记录]"]
-    for item in _walk_elements(element, depth + 1):
-        sender = _sender_label(item)
-        body = _text_of(item) or _render_element(item, depth + 1)
-        if body:
-            lines.append(f"> {sender}: {body}")
-    if len(lines) == 1:
-        lines.append("> [记录内容未识别]")
-    return "\n".join(lines)
-
-
-def _render_quote(element: Mapping[str, Any], depth: int) -> str:
-    reference = _as_mapping(element.get("message_reference") or element.get("reference"))
-    quoted = _text_of(reference) or _text_of(element.get("reference_content"))
-    if quoted:
-        return f"> 引用: {quoted}"
-    return "> [引用内容未识别]"
-
-
-def _render_element(element: Any, depth: int = 0) -> str:
-    """Render one msg_elements entry, recursing into forwarded records."""
-    item = _as_mapping(element)
-    if not item:
-        text = _text_of(element)
-        return text
-
-    raw_type = item.get("message_type", item.get("type"))
-    try:
-        msg_type = int(raw_type)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        msg_type = -1
-
-    if msg_type in (MSG_TYPE_TEXT, MSG_TYPE_MARKDOWN):
-        return _text_of(item)
-    if msg_type == MSG_TYPE_CHAT_RECORD:
-        return _render_chat_record(item, depth) if depth < _MAX_ELEMENT_DEPTH else ""
-    if msg_type == MSG_TYPE_QUOTE:
-        return _render_quote(item, depth)
-    if msg_type in (MSG_TYPE_ARK, MSG_TYPE_EMBED, MSG_TYPE_RICH):
-        if item.get("ark_data") or item.get("ark"):
-            return _render_card(item)
-        return _text_of(item)
-    if msg_type == MSG_TYPE_MEDIA:
-        return "[媒体]"
-    # Unknown type: keep an explicit marker so the Phase-0 census reveals it.
-    return _text_of(item) or f"[未知元素 type={raw_type!r}]"
-
-
-def _immediate_elements(container: Any) -> list[Mapping[str, Any]]:
-    """Return the container's direct ``msg_elements``, non-recursively."""
-    items = _as_mapping(container).get("msg_elements") or ()
-    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-        return []
-    return [mapped for item in list(items)[:_MAX_ELEMENTS] if (mapped := _as_mapping(item))]
-
-
-def _walk_elements(element: Any, depth: int = 0) -> list[Mapping[str, Any]]:
-    """Collect an element plus its nested ``msg_elements``, bounded in size."""
-    if depth > _MAX_ELEMENT_DEPTH:
-        return []
-    collected: list[Mapping[str, Any]] = []
-    for nested in _immediate_elements(element):
-        if len(collected) >= _MAX_ELEMENTS:
+    segments: list[TranscriptSegment] = []
+    for position, match in enumerate(matches):
+        if len(segments) >= _MAX_SEGMENTS:
             break
-        collected.append(nested)
-        collected.extend(_walk_elements(nested, depth + 1))
-    return collected
+        start = match.end()
+        end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        if not body:
+            continue
+        segments.append(
+            TranscriptSegment(index=_as_int(match.group(1), position + 1), content=body)
+        )
+    return tuple(segments)
 
 
-def _collect_message_ids(raw: Mapping[str, Any]) -> tuple[str, ...]:
-    ids: list[str] = []
+def extract_media_refs(transcript: str) -> tuple[MediaRef, ...]:
+    """Pull downloadable image references out of a transcript.
 
-    def add(value: Any) -> None:
-        text = str(value or "").strip()
-        if text and text not in ids:
-            ids.append(text)
-
-    add(raw.get("id"))
-    for element in _walk_elements(raw):
-        add(element.get("id") or element.get("msg_id"))
-    return tuple(ids)
-
-
-def _normalize_attachment(attachment: Any) -> dict[str, Any]:
-    item = _as_mapping(attachment)
-    return {
-        "content_type": str(item.get("content_type") or ""),
-        "filename": str(item.get("filename") or ""),
-        "size": item.get("size"),
-        "url": str(item.get("url") or ""),
-    }
-
-
-def is_downloadable_image(attachment: Mapping[str, Any]) -> bool:
-    """Return whether *attachment* looks like an image we can fetch."""
-    content_type = str(attachment.get("content_type") or "").lower()
-    if content_type.startswith("image/"):
-        return True
-    name = str(attachment.get("filename") or "").lower()
-    return name.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
+    Only lines carrying the ``类型:图片`` marker are collected: QQ's image URLs
+    end at ``/download`` with no extension, so the URL alone cannot tell an
+    image from a voice clip.
+    """
+    refs: list[MediaRef] = []
+    seen: set[str] = set()
+    for line in transcript.splitlines():
+        if not _ATTACHMENT_LINE_RE.search(line) or "图片" not in line:
+            continue
+        url_match = _URL_RE.search(line)
+        if not url_match:
+            continue
+        url = url_match.group(1)
+        if url in seen:
+            continue
+        seen.add(url)
+        name_match = _FILENAME_RE.search(line)
+        refs.append(MediaRef(url=url, filename=name_match.group(1) if name_match else ""))
+    return tuple(refs)
 
 
 def safe_attachment_name(msg_id: str, index: int, filename: str) -> str:
@@ -265,95 +236,79 @@ def safe_attachment_name(msg_id: str, index: int, filename: str) -> str:
     return f"{stem}_{index}_{name}"
 
 
-def _render_recent_messages(scene_ext: Any) -> str:
-    """Render ``message_scene.ext`` (the '最近 N 条' context) as a transcript."""
-    ext = _as_mapping(scene_ext)
-    entries = ext.get("msg_elements") or ext.get("messages") or ()
-    if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
-        return ""
-    lines = ["[群内最近消息]"]
-    for item in list(entries)[:_MAX_ELEMENTS]:
-        sender = _sender_label(_as_mapping(item))
-        body = _render_element(item)
-        if body:
-            lines.append(f"> {sender}: {body}")
-    return "\n".join(lines) if len(lines) > 1 else ""
-
-
 def flatten_group_payload(raw: Mapping[str, Any] | None) -> RichContent:
-    """Flatten a raw QQ group event payload into text, URLs and ids.
+    """Flatten a raw QQ group event payload into text, segments and media.
 
     Pure: performs no network or filesystem IO. Downloading ``media_urls`` and
-    writing files is the caller's job.
+    writing files is the caller's job. ``media_urls`` are the *live* URLs -- the
+    ``rkey`` they carry expires within minutes, which is why the redacted copy
+    in ``raw`` is kept separate from the fetchable one.
     """
     if not isinstance(raw, Mapping):
         return RichContent(text="")
 
-    blocks: list[str] = []
-    urls: list[str] = []
-    attachments: list[dict[str, Any]] = []
-
-    scene = _as_mapping(raw.get("message_scene"))
-    if recent := _render_recent_messages(scene.get("ext")):
-        blocks.append(recent)
-
-    elements = _immediate_elements(raw)
-    for element in elements:
-        rendered = _render_element(element)
-        if rendered:
-            blocks.append(f"{_sender_label(element)}: {rendered}")
-
-    top_ark = raw.get("ark_data")
-    if top_ark:
-        blocks.append(_render_card({"ark_data": top_ark}))
-
-    for attachment in raw.get("attachments") or ():
-        meta = _normalize_attachment(attachment)
-        if not meta["url"]:
-            continue
-        attachments.append(meta)
-        label = meta["filename"] or meta["content_type"] or "attachment"
-        if is_downloadable_image(meta):
-            urls.append(meta["url"])
-            blocks.append(f"[图片: {label}]")
-        else:
-            blocks.append(f"[附件: {label} ({meta['content_type']})]")
-
-    text = "\n\n".join(block for block in blocks if block.strip())
-    has_rich = bool(elements) or bool(top_ark) or bool(attachments)
+    transcript = _transcript_of(raw)
+    outer_id = str(raw.get("id") or "").strip()
     return RichContent(
-        text=text,
-        media_urls=tuple(dict.fromkeys(urls)),
-        message_ids=_collect_message_ids(raw),
-        attachments=tuple(attachments),
-        has_rich=has_rich,
+        text=transcript,
+        segments=split_transcript(transcript),
+        media=extract_media_refs(transcript),
+        message_ids=(outer_id,) if outer_id else (),
+        has_rich=bool(transcript),
         raw=redact_payload(dict(raw)),
     )
+
+
+def rewrite_media_links(transcript: str, saved: Mapping[str, str]) -> str:
+    """Swap every image line's live URL for the local file it was saved to.
+
+    The ``rkey`` in a QQ media URL stops working within minutes, so archiving
+    the URL verbatim would file away a link that is dead on arrival. ``saved``
+    maps URL -> local path for the downloads that landed; anything missing is
+    marked as failed rather than left pointing at the expired CDN.
+    """
+    if not transcript:
+        return transcript
+
+    def replace(match: re.Match[str]) -> str:
+        url = match.group(1)
+        path = saved.get(url)
+        return f"本地文件：{path}" if path else "[图片下载失败]"
+
+    # keepends: this text is archived verbatim, so line endings must survive.
+    lines = []
+    for line in transcript.splitlines(keepends=True):
+        if _ATTACHMENT_LINE_RE.search(line) and "图片" in line and _URL_RE.search(line):
+            line = _URL_RE.sub(replace, line, count=1)
+        lines.append(line)
+    return "".join(lines)
 
 
 def census(raw: Mapping[str, Any] | None) -> str:
     """Return a one-line field signature of a raw payload.
 
-    This is the Phase-0 instrument: it answers "does QQ actually send
-    msg_elements / ark_data / message_scene?" without dumping the whole event.
+    The Phase-0 instrument: it answered "does QQ actually send a transcript?"
+    without dumping whole events. Kept because it is the cheapest way to spot
+    the shape changing under us.
     """
     if not isinstance(raw, Mapping):
         return "payload=absent"
 
-    scene = _as_mapping(raw.get("message_scene"))
-    ext = scene.get("ext")
-    elements = _immediate_elements(raw)
-    first_type = elements[0].get("message_type") if elements else None
+    transcript = _transcript_of(raw)
+    scene_ext = _as_mapping(raw.get("message_scene")).get("ext")
+    elements = raw.get("msg_elements")
     author = _as_mapping(raw.get("author"))
 
     def count(value: Any) -> int:
-        return len(value) if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) else 0
+        return len(value) if isinstance(value, (list, tuple)) else 0
 
     return (
         f"msg_id={raw.get('id')!r} message_type={raw.get('message_type')!r} "
-        f"n_msg_elements={len(elements)} first_elem_type={first_type!r} "
+        f"n_msg_elements={count(elements)} transcript_len={len(transcript)} "
+        f"n_segments={len(split_transcript(transcript))} "
+        f"n_images={len(extract_media_refs(transcript))} "
         f"has_ark={bool(raw.get('ark_data'))} n_attachments={count(raw.get('attachments'))} "
-        f"has_scene_ext={bool(ext)} scene_ext_type={type(ext).__name__} "
-        f"n_mentions={count(raw.get('mentions'))} content_len={len(str(raw.get('content') or ''))} "
+        f"n_scene_ext={count(scene_ext)} n_mentions={count(raw.get('mentions'))} "
+        f"content_len={len(str(raw.get('content') or ''))} "
         f"author_keys={sorted(author)} timestamp={raw.get('timestamp')!r}"
     )

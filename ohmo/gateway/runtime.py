@@ -34,6 +34,7 @@ from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
 from ohmo.gateway.config import load_gateway_config
+from ohmo.gateway.gossip_tool import OhmoSaveGossipTool
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
@@ -73,6 +74,14 @@ _IMAGE_FALLBACK_NOTE = (
 )
 _NO_GROUP_REQUEST = object()
 _GROUP_TOOL_NAME = "ohmo_create_feishu_group"
+_GOSSIP_TOOL_NAME = "ohmo_save_gossip"
+
+# Tools whose progress hints are never sent to the channel. A hint carries the
+# tool input, and the gossip tool's input is the gist -- putting it in the group
+# would spend a passive-reply slot to spoil the summary the user is about to get
+# anyway. Keeping this list lets QQ turn progress hints back on for every other
+# tool without leaking this one.
+_QUIET_TOOL_NAMES = frozenset({_GOSSIP_TOOL_NAME})
 _GROUP_AGENT_PROMPT_PREFIX = "The user invoked `/group` from a Feishu private chat."
 _GROUP_AGENT_PROMPT_REQUEST_MARKER = "User /group request:"
 _GROUP_METADATA_KEYS = (
@@ -423,6 +432,7 @@ class OhmoSessionRuntimePool:
             metadata={"_progress": True, "_session_key": session_key},
         )
         previous_group_request = self._set_group_request_context(bundle, message, session_key)
+        self._set_gossip_request_context(bundle, message, session_key)
         try:
             async for event in bundle.engine.submit_message(user_message):
                 if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
@@ -476,12 +486,15 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             self._restore_group_request_context(bundle, previous_group_request)
+            self._restore_gossip_request_context(bundle)
             await self._save_snapshot(bundle, session_key, user_prompt)
             return
         except Exception:
             self._restore_group_request_context(bundle, previous_group_request)
+            self._restore_gossip_request_context(bundle)
             raise
         self._restore_group_request_context(bundle, previous_group_request)
+        self._restore_gossip_request_context(bundle)
         await self._save_snapshot(bundle, session_key, user_prompt)
         reply = "".join(reply_parts).strip()
         if reply:
@@ -569,6 +582,9 @@ class OhmoSessionRuntimePool:
                 event.tool_name,
                 summary,
             )
+            if event.tool_name in _QUIET_TOOL_NAMES:
+                # Logged above so the call is still traceable; just not announced.
+                return
             hint = f"Using {event.tool_name}"
             if summary:
                 hint = f"{hint}: {summary}"
@@ -729,6 +745,26 @@ class OhmoSessionRuntimePool:
 
     def _register_gateway_tools(self, bundle: RuntimeBundle) -> None:
         self._unregister_group_tool(bundle)
+        self._register_gossip_tool(bundle)
+
+    def _register_gossip_tool(self, bundle: RuntimeBundle) -> None:
+        """Register the gossip tool for the lifetime of the bundle.
+
+        Registered once and left alone, unlike the Feishu group tool. Two
+        reasons: the prompt section describing it is channel-independent and is
+        assembled for every session, so a tool that only appeared on QQ group
+        turns would leave the model told about a tool it cannot see; and the
+        tools array is sent on every request, so registering and unregistering
+        per turn would invalidate the provider's cached tools prefix each time.
+
+        Safety comes from the context guard instead: the tool no-ops unless the
+        runtime injected a QQ group request for the current turn, and a stale
+        registration is therefore harmless.
+        """
+        registry = getattr(bundle, "tool_registry", None)
+        if registry is None or registry.get(_GOSSIP_TOOL_NAME) is not None:
+            return
+        registry.register(OhmoSaveGossipTool(workspace=self._workspace))
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
@@ -784,6 +820,55 @@ class OhmoSessionRuntimePool:
         metadata.pop("ohmo_group_request", None)
         metadata.pop("_suppress_next_user_goal", None)
         OhmoSessionRuntimePool._unregister_group_tool(bundle)
+
+    def _set_gossip_request_context(
+        self,
+        bundle: RuntimeBundle,
+        message: InboundMessage,
+        session_key: str,
+    ) -> None:
+        """Expose this turn's QQ group message to the gossip tool.
+
+        The original text travels here rather than through the tool arguments on
+        purpose: a model that supplies the text can rewrite it, and the archive
+        is only worth anything if it holds what was actually sent.
+        """
+        metadata = getattr(bundle.engine, "tool_metadata", None)
+        if not isinstance(metadata, dict):
+            return
+        if message.channel != "qq" or str(message.metadata.get("chat_type") or "").lower() != "group":
+            metadata.pop("ohmo_gossip_request", None)
+            return
+        metadata["ohmo_gossip_request"] = {
+            "channel": message.channel,
+            "chat_id": str(message.chat_id),
+            "sender_member_id": str(message.metadata.get("sender_member_id") or ""),
+            "sender_display_name": message.metadata.get("sender_display_name"),
+            "message_ids": list(
+                message.metadata.get("qq_message_ids") or [message.metadata.get("message_id") or ""]
+            ),
+            "created_at": message.metadata.get("qq_timestamp"),
+            "raw_text": str(message.content or ""),
+            "segments": [
+                {"index": segment.get("index"), "content": segment.get("content")}
+                for segment in (message.metadata.get("qq_segments") or [])
+                if isinstance(segment, dict)
+            ],
+            "media": list(message.media or []),
+            "raw_payload": message.metadata.get("qq_payload"),
+            "session_key": session_key,
+        }
+
+    @staticmethod
+    def _restore_gossip_request_context(bundle: RuntimeBundle) -> None:
+        """Drop the QQ group context so it cannot leak into the next turn.
+
+        Must run before the snapshot is saved: the raw payload and attachment
+        paths would otherwise be written verbatim into ``sessions/*.json``.
+        """
+        metadata = getattr(bundle.engine, "tool_metadata", None)
+        if isinstance(metadata, dict):
+            metadata.pop("ohmo_gossip_request", None)
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:

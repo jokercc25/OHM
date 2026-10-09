@@ -3,6 +3,7 @@ from pathlib import Path
 from ohmo.workspace import (
     get_bootstrap_path,
     get_gateway_config_path,
+    get_gossip_dir,
     get_identity_path,
     get_memory_index_path,
     get_soul_path,
@@ -22,6 +23,7 @@ def test_initialize_workspace_creates_expected_files(tmp_path: Path):
     assert get_bootstrap_path(workspace).exists()
     assert get_memory_index_path(workspace).exists()
     assert get_gateway_config_path(workspace).exists()
+    assert get_gossip_dir(workspace).is_dir()
 
     health = workspace_health(workspace)
     assert all(health.values())

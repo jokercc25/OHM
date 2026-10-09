@@ -217,13 +217,23 @@ class ChannelManager:
                     timeout=1.0
                 )
 
+                channel = self.channels.get(msg.channel)
+
                 if msg.metadata.get("_progress"):
-                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                    # Resolve the channel first so a per-channel override can win.
+                    # None means "inherit the container-wide default".
+                    channel_config = getattr(channel, "config", None)
+                    hints = getattr(channel_config, "send_tool_hints", None)
+                    progress = getattr(channel_config, "send_progress", None)
+                    if hints is None:
+                        hints = self.config.channels.send_tool_hints
+                    if progress is None:
+                        progress = self.config.channels.send_progress
+                    if msg.metadata.get("_tool_hint") and not hints:
                         continue
-                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                    if not msg.metadata.get("_tool_hint") and not progress:
                         continue
 
-                channel = self.channels.get(msg.channel)
                 if channel:
                     try:
                         await channel.send(msg)

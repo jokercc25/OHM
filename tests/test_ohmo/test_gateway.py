@@ -31,12 +31,14 @@ from openharness.engine.stream_events import (
 )
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
+from openharness.memory.schema import split_memory_file
 from openharness.permissions import PermissionChecker, PermissionMode
 from openharness.tasks.manager import get_task_manager
 from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
-from ohmo.gateway.config import load_gateway_config, save_gateway_config
+from ohmo.gateway.config import build_channel_manager_config, load_gateway_config, save_gateway_config
+from ohmo.gateway.gossip_tool import OhmoSaveGossipInput, OhmoSaveGossipTool
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
 from ohmo.gateway.models import GatewayConfig, GatewayState
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
@@ -52,6 +54,7 @@ from ohmo.group_registry import load_managed_group_record, save_managed_group_re
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
+from ohmo.gossip import gossip_entries_dir, list_gossip_headers
 from ohmo.session_storage import save_session_snapshot
 from ohmo.workspace import get_gateway_restart_notice_path, get_skills_dir, initialize_workspace
 
@@ -2403,6 +2406,249 @@ async def test_ohmo_create_feishu_group_tool_rejects_without_slash_group_context
 
     assert result.is_error is True
     assert "only run immediately" in result.output
+
+
+_GOSSIP_TRANSCRIPT = """=== 消息 1 ===
+[消息内容] @奇希莉卡 看看这个
+=== 消息 2 ===
+[消息内容] [群聊的聊天记录]
+[消息类型] 合并转发消息
+--- 第1条 ---
+    [消息内容] 显卡下周降价
+    [发送者] 旺旺雪饼"""
+
+
+def _gossip_request(**overrides: object) -> dict[str, object]:
+    """The context the runtime injects for one QQ group turn."""
+    request: dict[str, object] = {
+        "channel": "qq",
+        "chat_id": "GROUP_OPENID_1",
+        "sender_member_id": "U1",
+        "sender_display_name": "调皮的小男孩",
+        "message_ids": ["ROBOT1.0_AAA"],
+        "created_at": "2026-10-09T10:38:56+08:00",
+        "raw_text": _GOSSIP_TRANSCRIPT,
+        "segments": [
+            {"index": 1, "content": "[消息内容] @奇希莉卡 看看这个"},
+            {
+                "index": 2,
+                "content": "[消息内容] [群聊的聊天记录]\n[消息类型] 合并转发消息\n"
+                "--- 第1条 ---\n    [消息内容] 显卡下周降价\n    [发送者] 旺旺雪饼",
+            },
+        ],
+        "media": [],
+        "raw_payload": None,
+        "session_key": "qq:GROUP_OPENID_1|U1",
+    }
+    request.update(overrides)
+    return request
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_writes_an_entry(tmp_path):
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="旺旺雪饼转发：显卡下周降价", tags=["显卡"], importance=2),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": _gossip_request()}),
+    )
+
+    assert result.is_error is False
+    assert "旺旺雪饼转发：显卡下周降价" in result.output
+
+    headers = list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")
+    assert len(headers) == 1
+    assert headers[0].description == "旺旺雪饼转发：显卡下周降价"
+    entry = next(gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").glob("*.md"))
+    metadata, body, _, _ = split_memory_file(entry.read_text(encoding="utf-8"))
+    assert metadata["sender_display_name"] == "调皮的小男孩"
+    assert metadata["msg_ids"] == ["ROBOT1.0_AAA"]
+    # The archived text is the runtime's copy, not anything the model wrote.
+    assert "[发送者] 旺旺雪饼" in body
+    assert "旺旺雪饼转发：显卡下周降价" not in body
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_reads_the_named_segment_verbatim(tmp_path):
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="显卡下周降价", which=2),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": _gossip_request()}),
+    )
+
+    assert result.is_error is False
+    entry = next(gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").glob("*.md"))
+    _, body, _, _ = split_memory_file(entry.read_text(encoding="utf-8"))
+    assert "[群聊的聊天记录]" in body
+    assert "@奇希莉卡 看看这个" not in body
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_rejects_an_unknown_segment(tmp_path):
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="随便", which=9),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": _gossip_request()}),
+    )
+
+    assert result.is_error is True
+    assert "9" in result.output
+    assert not gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").exists()
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_rejects_without_group_context(tmp_path):
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="随便"),
+        ToolExecutionContext(cwd=tmp_path, metadata={}),
+    )
+
+    assert result.is_error is True
+    assert "QQ 群" in result.output
+    assert not (tmp_path / "gossip").exists()
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_result_never_carries_media_keys(tmp_path):
+    """``media`` / ``paths`` in a tool result spend another passive reply."""
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="带图的瓜"),
+        ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={"ohmo_gossip_request": _gossip_request(media=["/workspace/attachments/qq/a.jpg"])},
+        ),
+    )
+
+    assert result.is_error is False
+    assert "media" not in result.metadata
+    assert "paths" not in result.metadata
+    assert result.metadata["gossip_path"].endswith(".md")
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_can_archive_gossip_via_ohmo_gossip_tool(tmp_path):
+    class FakeApiClient:
+        def __init__(self):
+            self.requests = []
+            self.responses = [
+                ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="toolu_gossip",
+                            name="ohmo_save_gossip",
+                            input={"gist": "旺旺雪饼转发：显卡下周降价", "which": 2, "importance": 2},
+                        )
+                    ],
+                ),
+                ConversationMessage(role="assistant", content=[TextBlock(text="记下了。")]),
+            ]
+
+        async def stream_message(self, request):
+            self.requests.append(request)
+            yield ApiMessageCompleteEvent(
+                message=self.responses.pop(0),
+                usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+                stop_reason=None,
+            )
+
+    registry = ToolRegistry()
+    registry.register(OhmoSaveGossipTool(workspace=tmp_path))
+    client = FakeApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=registry,
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.DEFAULT)),
+        cwd=tmp_path,
+        model="fake-model",
+        system_prompt="system",
+        tool_metadata={"ohmo_gossip_request": _gossip_request()},
+    )
+
+    events = [event async for event in engine.submit_message("存一下这个")]
+
+    completed = [event for event in events if isinstance(event, ToolExecutionCompleted)]
+    assert len(completed) == 1
+    assert completed[0].tool_name == "ohmo_save_gossip"
+    assert completed[0].is_error is False
+    assert "ohmo_save_gossip" in {tool["name"] for tool in client.requests[0].tools}
+    assert len(list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")) == 1
+
+
+def test_runtime_pool_injects_gossip_context_only_for_qq_groups(tmp_path):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    engine = SimpleNamespace(tool_metadata={})
+    bundle = SimpleNamespace(engine=engine, tool_registry=ToolRegistry())
+
+    pool._set_gossip_request_context(
+        bundle,
+        InboundMessage(
+            channel="qq",
+            sender_id="GROUP_OPENID_1|U1",
+            chat_id="GROUP_OPENID_1",
+            content=_GOSSIP_TRANSCRIPT,
+            metadata={
+                "chat_type": "group",
+                "group_openid": "GROUP_OPENID_1",
+                "sender_member_id": "U1",
+                "sender_display_name": "调皮的小男孩",
+                "qq_message_ids": ["ROBOT1.0_AAA"],
+                "qq_timestamp": "2026-10-09T10:38:56+08:00",
+                "qq_segments": [{"index": 2, "content": "显卡下周降价"}],
+            },
+        ),
+        "qq:GROUP_OPENID_1|U1",
+    )
+    request = engine.tool_metadata["ohmo_gossip_request"]
+    assert request["chat_id"] == "GROUP_OPENID_1"
+    assert request["raw_text"] == _GOSSIP_TRANSCRIPT
+    assert request["segments"] == [{"index": 2, "content": "显卡下周降价"}]
+
+    pool._restore_gossip_request_context(bundle)
+    assert "ohmo_gossip_request" not in engine.tool_metadata
+
+    # A Feishu turn must not inherit the previous turn's QQ request either.
+    engine.tool_metadata["ohmo_gossip_request"] = {"channel": "qq"}
+    pool._set_gossip_request_context(
+        bundle,
+        InboundMessage(channel="feishu", sender_id="ou_user", chat_id="ou_user", content="hi"),
+        "feishu:ou_user",
+    )
+    assert "ohmo_gossip_request" not in engine.tool_metadata
+
+
+def test_gateway_config_projects_a_per_channel_quiet_override(tmp_path):
+    config = GatewayConfig(
+        enabled_channels=["qq", "feishu"],
+        send_progress=True,
+        send_tool_hints=True,
+        channel_configs={"qq": {"app_id": "1", "allow_from": ["*"], "send_progress": False, "send_tool_hints": False}},
+    )
+
+    manager_config = build_channel_manager_config(config)
+
+    # QQ opts out of the progress stream so its 5-per-msg_id passive budget is
+    # spent on the answer; Feishu keeps inheriting the container-wide default.
+    assert manager_config.channels.qq.send_progress is False
+    assert manager_config.channels.qq.send_tool_hints is False
+    assert manager_config.channels.qq.enabled is True
+    assert manager_config.channels.feishu.send_progress is None
+    assert manager_config.channels.feishu.send_tool_hints is None
+    assert manager_config.channels.send_progress is True
+
+
+def test_runtime_pool_registers_the_gossip_tool_but_only_for_group_commands(tmp_path):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    bundle = SimpleNamespace(engine=SimpleNamespace(tool_metadata={}), tool_registry=ToolRegistry())
+
+    pool._register_gateway_tools(bundle)
+
+    # Persistent, unlike the Feishu group tool: the prompt section is rendered
+    # for every session, so the tool must be visible to every session too.
+    assert bundle.tool_registry.get("ohmo_save_gossip") is not None
 
 
 @pytest.mark.asyncio
