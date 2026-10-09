@@ -8,6 +8,11 @@ services:
       TZ: Asia/Shanghai
       OHMO_WORKSPACE: /workspace
       OPENHARNESS_CONFIG_DIR: /config
+      # Phase-0 载荷探针（默认关）。由宿主机的 shell 变量控制，本文件不必改：
+      #   OHMO_QQ_DEBUG_PAYLOAD=1 docker compose up -d --build
+      # 打开后会打一行 "QQ payload census" 日志，并把脱敏后的完整载荷写到
+      # ./.ohmo/logs/qq-payload/<msg_id>.json。去掉前缀重启即关闭。
+      OHMO_QQ_DEBUG_PAYLOAD: "${OHMO_QQ_DEBUG_PAYLOAD:-}"
     volumes:
       # 奇希莉卡的配置 + 人设 + 记忆 + 会话（含密钥，本地已存在，直接挂载）
       - ./.ohmo:/workspace

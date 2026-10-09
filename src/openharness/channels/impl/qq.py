@@ -1,16 +1,20 @@
 """QQ channel implementation using botpy SDK."""
 
 import asyncio
+import json
 import logging
+import os
 import re
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
-
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
+from openharness.channels.impl.qq_rich import census, flatten_group_payload
 from openharness.config.schema import QQConfig
+from openharness.utils.fs import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,85 @@ if TYPE_CHECKING:
 # Best-effort strip of a leading @-mention. Official group messages fire only
 # when the bot is @mentioned, and some payloads keep the @ text in content.
 _AT_MENTION_RE = re.compile(r"^\s*@[^\s]+\s*")
+
+# Subdirectory of the workspace log dir used by the OHMO_QQ_DEBUG_PAYLOAD dump.
+_DEBUG_PAYLOAD_DIRNAME = "qq-payload"
+
+# How long a single client.start() may run before we treat the connection as
+# wedged. botpy can hang here without raising, which is how the bot went silent
+# for two weeks: the process never exited, so `restart: unless-stopped` never
+# fired. Bounding it forces the reconnect loop to make progress.
+_CONNECT_TIMEOUT_SECONDS = 15 * 60
+_RECONNECT_BASE_SECONDS = 5
+_RECONNECT_MAX_SECONDS = 300
+
+
+def _install_botpy_payload_hook() -> None:
+    """Keep the raw QQ event payload on the message object.
+
+    botpy reads a fixed set of keys out of the event and drops the dict, so
+    fields like ``msg_elements`` / ``ark_data`` / ``message_scene`` and the
+    author's nickname are unreachable. ``connection.parse_*`` looks the class up
+    in its module globals at call time, and ``__slots__`` chains are add-only,
+    so rebinding with a subclass that stashes ``data`` recovers them.
+
+    Feature-detected and non-fatal: if botpy changes shape we degrade to the
+    stock fields rather than crashing the channel.
+    """
+    try:
+        import botpy.connection as _bc
+    except Exception:
+        logger.exception("QQ raw payload hook unavailable; rich fields will be skipped")
+        return
+    if getattr(getattr(_bc, "GroupMessage", None), "_ohmo_raw_capable", False):
+        return
+    try:
+
+        class _RawGroupMessage(_bc.GroupMessage):  # type: ignore[misc, valid-type]
+            __slots__ = ("raw",)
+            _ohmo_raw_capable = True
+
+            def __init__(self, api, event_id, data):
+                super().__init__(api, event_id, data)
+                self.raw = dict(data or {})
+
+        class _RawC2CMessage(_bc.C2CMessage):  # type: ignore[misc, valid-type]
+            __slots__ = ("raw",)
+            _ohmo_raw_capable = True
+
+            def __init__(self, api, event_id, data):
+                super().__init__(api, event_id, data)
+                self.raw = dict(data or {})
+
+        _bc.GroupMessage = _RawGroupMessage
+        _bc.C2CMessage = _RawC2CMessage
+        logger.info("QQ raw payload hook installed")
+    except Exception:
+        logger.exception("QQ raw payload hook unavailable; rich fields will be skipped")
+
+
+def _debug_payload_enabled() -> bool:
+    """Whether the Phase-0 payload census dump is switched on."""
+    return os.environ.get("OHMO_QQ_DEBUG_PAYLOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dump_qq_payload(content, message_id: str) -> None:
+    """Persist one redacted raw payload for offline inspection.
+
+    ``content`` is a :class:`RichContent` whose ``raw`` field is already
+    redacted (rkey / auth_token / msg_idx removed) by ``qq_rich``.
+    """
+    raw = getattr(content, "raw", None)
+    if not isinstance(raw, dict):
+        return
+    workspace = os.environ.get("OHMO_WORKSPACE") or "."
+    dump_dir = Path(workspace) / "logs" / _DEBUG_PAYLOAD_DIRNAME
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", message_id or "unknown")[:80] or "unknown"
+        atomic_write_text(dump_dir / f"{name}.json", json.dumps(raw, ensure_ascii=False, indent=2))
+    except Exception:
+        logger.exception("QQ payload dump failed")
 
 
 def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
@@ -84,6 +167,7 @@ class QQChannel(BaseChannel):
             logger.error("QQ app_id and app_secret not configured")
             return
 
+        _install_botpy_payload_hook()
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
@@ -92,15 +176,26 @@ class QQChannel(BaseChannel):
         await self._run_bot()
 
     async def _run_bot(self) -> None:
-        """Run the bot connection with auto-reconnect."""
+        """Run the bot connection with auto-reconnect and backoff."""
+        backoff = _RECONNECT_BASE_SECONDS
         while self._running:
             try:
-                await self._client.start(appid=self.config.app_id, secret=self.config.app_secret)
+                await asyncio.wait_for(
+                    self._client.start(appid=self.config.app_id, secret=self.config.app_secret),
+                    timeout=_CONNECT_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # botpy can wedge without raising; without this bound the process
+                # never exits and `restart: unless-stopped` never fires.
+                logger.error("QQ bot connection wedged for %ss, forcing reconnect", _CONNECT_TIMEOUT_SECONDS)
             except Exception as e:
                 logger.warning("QQ bot error: %s", e)
+            else:
+                backoff = _RECONNECT_BASE_SECONDS
             if self._running:
-                logger.info("Reconnecting QQ bot in 5 seconds...")
-                await asyncio.sleep(5)
+                logger.info("Reconnecting QQ bot in %s seconds...", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _RECONNECT_MAX_SECONDS)
 
     async def stop(self) -> None:
         """Stop the QQ bot."""
@@ -182,6 +277,20 @@ class QQChannel(BaseChannel):
                 logger.warning("QQ group message missing group_openid, ignoring")
                 return
 
+            # Raw payload is only present when _install_botpy_payload_hook()
+            # succeeded; without it we fall back to the stock botpy fields.
+            raw = getattr(data, "raw", None)
+            if not isinstance(raw, dict):
+                raw = None
+            rich = flatten_group_payload(raw)
+
+            # Phase-0 instrument. Runs *before* the content checks below so that
+            # card-only messages (empty `content`) are still observed — those are
+            # exactly the messages we need to characterise.
+            if raw is not None and _debug_payload_enabled():
+                logger.info("QQ payload census %s", census(raw))
+                _dump_qq_payload(rich, message_id)
+
             author = data.author
             member_id = str(
                 getattr(author, "member_openid", None)
@@ -202,19 +311,36 @@ class QQChannel(BaseChannel):
             if message_id:
                 self._group_msg_ids[group_openid] = message_id
 
+            # botpy's GroupMessage._User only carries member_openid, so the
+            # nickname is reachable only through the raw payload. Supplying it
+            # lets runtime._build_speaker_context name the sender instead of
+            # printing the opaque "group_openid|member_openid" pair.
+            author_raw = raw.get("author") if raw else None
+            display_name = ""
+            if isinstance(author_raw, dict):
+                display_name = str(author_raw.get("username") or "").strip()
+
+            metadata = {
+                "message_id": message_id,
+                "group_openid": group_openid,
+                "chat_type": "group",
+                "is_group": True,
+                "sender_member_id": member_id,
+            }
+            if display_name:
+                metadata["sender_display_name"] = display_name
+            if raw is not None:
+                metadata["qq_timestamp"] = raw.get("timestamp")
+                metadata["qq_message_ids"] = list(rich.message_ids)
+                metadata["qq_payload"] = rich.raw
+
             # Pipe-join group + member so allow_from can match either the whole
             # group (group_openid) or a specific member (member_openid).
             await self._handle_message(
                 sender_id=f"{group_openid}|{member_id}",
                 chat_id=group_openid,
                 content=content,
-                metadata={
-                    "message_id": message_id,
-                    "group_openid": group_openid,
-                    "chat_type": "group",
-                    "is_group": True,
-                    "sender_member_id": member_id,
-                },
+                metadata=metadata,
             )
         except Exception:
             logger.exception("Error handling QQ group message")

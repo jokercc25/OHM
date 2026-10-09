@@ -14,8 +14,10 @@ WORKDIR /app
 # by .dockerignore and mounted as volumes at runtime instead.
 COPY . .
 
-# Install the package plus the QQ bot SDK (qq-botpy is not in pyproject.toml)
-RUN pip install . "qq-botpy"
+# Install the package plus the QQ bot SDK (qq-botpy is not in pyproject.toml).
+# Pinned: channels/impl/qq.py subclasses botpy.connection.GroupMessage to recover
+# the raw event payload, which only works against this internal layout.
+RUN pip install . "qq-botpy==1.2.1"
 
 # Config / state locations (mounted as volumes at runtime — see docker-compose.yml)
 ENV OHMO_WORKSPACE=/workspace \
