@@ -1,0 +1,36 @@
+docker-compose.yml
+  s_b4325cc4699024::t_ad93c191116676 11-15
+src/openharness/channels/impl/qq.py
+  s_b4325cc4699024::t_c0d35a48f5cac0 39-117
+  s_b4325cc4699024::t_236d24ec1da852 280-293,314-336,343
+  s_b4325cc4699024::t_81d814f9dab168 4,6,9,15,17
+  s_b4325cc4699024::t_e19c5afc521674 170,179-180,183-190,193-194,196-198
+tests/test_channels/test_qq_rich.py
+  s_b4325cc4699024::t_711fb1980e8590 1-285
+Dockerfile
+  s_b4325cc4699024::t_3b728c931188a8 17-20
+src/openharness/channels/impl/qq_rich.py
+  s_b4325cc4699024::t_c5c478dfba7a12 200-207,213,216-217
+  s_b4325cc4699024::t_00274597b45bad 255-263
+  s_b4325cc4699024::t_dea2213908125c 18
+  s_b4325cc4699024::t_79c9150f61cb34 345-346,354
+  s_b4325cc4699024::t_fa9980261d69f6 300
+  s_b4325cc4699024::t_e88523549cd855 38
+  s_b4325cc4699024::t_292d3427e71800 1-17,19-37,39-199,208-212,214-215,218-254,264-299,301-344,347-353,355-359
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "288c287fca3bc9b7ba1f9c1af19b808cf25cf2c3",
+  "prompts": {},
+  "sessions": {
+    "s_b4325cc4699024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4ad383c-9b97-44b8-9215-87896cb50d3a",
+        "model": "deepseek-flash"
+      },
+      "human_author": "zhenglixin.11 <zhenglixin.11@jd.com>"
+    }
+  }
+}
