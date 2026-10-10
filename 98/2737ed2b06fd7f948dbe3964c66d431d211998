@@ -1,0 +1,23 @@
+src/openharness/channels/impl/qq.py
+  s_b4325cc4699024::t_cf4727accee000 28
+  s_b4325cc4699024::t_b600619ff5a384 74-79
+  s_b4325cc4699024::t_73a75a3ffe9878 266-273,277-298,300-322
+tests/test_channels/test_qq_send_split.py
+  s_b4325cc4699024::t_1075034b20d8e9 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "982737ed2b06fd7f948dbe3964c66d431d211998",
+  "prompts": {},
+  "sessions": {
+    "s_b4325cc4699024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4ad383c-9b97-44b8-9215-87896cb50d3a",
+        "model": "unknown"
+      },
+      "human_author": "zhenglixin.11 <zhenglixin.11@jd.com>"
+    }
+  }
+}
