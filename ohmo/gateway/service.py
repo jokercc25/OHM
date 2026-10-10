@@ -59,6 +59,7 @@ class OhmoGatewayService:
             provider_profile=self._config.provider_profile,
             create_feishu_group=self.create_group_for_user,
             publish_group_welcome=self.publish_group_welcome,
+            publish_gossip_text=self.publish_gossip_text,
         )
         self._stop_event: asyncio.Event | None = None
         self._restart_requested = False
@@ -146,6 +147,23 @@ class OhmoGatewayService:
                 chat_id=chat_id,
                 content=content,
                 metadata={"chat_type": "group", "_session_key": f"feishu:{chat_id}:{owner_open_id}"},
+            )
+        )
+
+    async def publish_gossip_text(self, chat_id: str, content: str, channel: str) -> None:
+        """Send one gossip-archive message into the group it came from.
+
+        Same shape as ``publish_group_welcome``: the caller has already chunked
+        the text to fit the channel's per-message limit, and the channel's own
+        outbound path does the passive-reply bookkeeping. Deliberately not
+        ``_session_key``-tagged -- this message is not a model reply.
+        """
+        await self._bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                metadata={"chat_type": "group"},
             )
         )
 

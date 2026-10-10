@@ -17,18 +17,25 @@ def find_relevant_memories(
     cwd: str | Path,
     *,
     max_results: int = 5,
+    memory_dir: str | Path | None = None,
+    max_files: int | None = 100,
 ) -> list[MemoryHeader]:
     """Return the memory files whose metadata and content overlap the query.
 
     Scoring weights frontmatter fields higher than body content so that
     well-annotated memories surface first.
+
+    ``memory_dir`` searches a store other than the cwd's project memory -- the
+    ohmo gossip archive, for instance, which keeps entries in its own tree. It
+    is the same parameter ``scan_memory_files`` already takes and defaults to
+    the previous behaviour.
     """
     tokens = _tokenize(query)
     if not tokens:
         return []
 
     scored: list[tuple[float, MemoryHeader]] = []
-    for header in scan_memory_files(cwd, max_files=100):
+    for header in scan_memory_files(cwd, max_files=max_files, memory_dir=memory_dir):
         meta = f"{header.title} {header.description}".lower()
         body = header.body_preview.lower()
 

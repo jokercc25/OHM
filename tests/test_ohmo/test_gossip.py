@@ -7,17 +7,25 @@ from pathlib import Path
 from openharness.memory.schema import parse_datetime, split_memory_file
 
 from ohmo.gossip import (
+    DISPLAY_CHUNK_CHARS,
+    MAX_DISPLAY_MESSAGES,
     GossipSaveResult,
     build_gossip_index,
     compose_gossip_body,
+    find_gossip_entry,
+    format_gossip_body,
+    format_gossip_listing,
+    format_gossip_messages,
     gossip_entries_dir,
     gossip_group_dir,
     gossip_index_path,
     list_gossip_headers,
     load_gossip_prompt,
+    load_gossip_entry,
     normalize_gist,
     safe_segment,
     save_gossip_entry,
+    search_gossip,
 )
 from ohmo.workspace import get_gossip_dir, initialize_workspace
 
@@ -296,3 +304,181 @@ def test_prompt_renders_on_an_empty_workspace(tmp_path: Path):
 
     assert prompt is not None
     assert "共 0 个群、0 条" in prompt
+
+
+# --- phase 2: reading the archive back ---------------------------------------
+
+
+def test_load_returns_the_stored_original_verbatim(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    saved = _save(
+        workspace,
+        raw_text=_FORWARD,
+        gist="旺旺雪饼转发",
+        media_paths=["/data/IMG_1_a.jpg", "/data/IMG_2_b.png"],
+    )
+
+    entry = load_gossip_entry(saved.path)
+
+    # Byte for byte what the channel captured -- whitespace and all, minus only
+    # the strip save_gossip_entry already applied on the way in.
+    assert entry.raw_text == _FORWARD.strip()
+    assert entry.media_paths == ("/data/IMG_1_a.jpg", "/data/IMG_2_b.png")
+    assert entry.gist == "旺旺雪饼转发"
+    assert entry.id.startswith("mem-")
+    assert entry.created_at
+
+
+def test_load_on_an_entry_without_images_has_no_media(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    saved = _save(workspace, raw_text="纯文字的瓜", gist="纯文字")
+
+    entry = load_gossip_entry(saved.path)
+
+    assert entry.raw_text == "纯文字的瓜"
+    assert entry.media_paths == ()
+
+
+def test_display_is_the_original_with_image_placeholders_appended(tmp_path: Path):
+    """QQ's group API takes a public URL, so an attachment is named, not sent."""
+    workspace = _workspace(tmp_path)
+    saved = _save(workspace, raw_text=_FORWARD, gist="瓜", media_paths=["/data/IMG_1_a.jpg"])
+
+    text = format_gossip_body(load_gossip_entry(saved.path))
+
+    assert text.startswith(_FORWARD.strip())
+    assert text.endswith("[图片1] IMG_1_a.jpg")
+
+
+def test_display_of_a_text_only_entry_is_the_original_untouched(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    saved = _save(workspace, raw_text=_FORWARD, gist="瓜")
+
+    assert format_gossip_body(load_gossip_entry(saved.path)) == _FORWARD.strip()
+
+
+def test_an_entry_with_no_text_still_names_its_images(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    saved = _save(
+        workspace,
+        raw_text="",
+        gist="只有图",
+        media_paths=["/data/IMG_1_a.jpg"],
+    )
+
+    text = format_gossip_body(load_gossip_entry(saved.path))
+
+    # compose_gossip_body stores a placeholder for the missing text; the display
+    # still has to name the attachment it is standing in for.
+    assert text.endswith("[图片1] IMG_1_a.jpg")
+
+
+def test_short_text_is_not_split():
+    assert format_gossip_messages(_FORWARD) == [_FORWARD]
+
+
+def test_long_text_is_capped_and_says_so():
+    """QQ allows five passive replies per inbound message and the turn spends
+    some of them; an unannounced cut would read as the whole record."""
+    text = "字" * 6_000
+
+    messages = format_gossip_messages(text)
+
+    assert len(messages) == MAX_DISPLAY_MESSAGES
+    assert all(len(message) <= DISPLAY_CHUNK_CHARS + 100 for message in messages)
+    assert "已截断" in messages[-1]
+    assert "共 6000 字" in messages[-1]
+    assert "已发 5400 字" in messages[-1]
+
+
+def test_empty_text_produces_no_messages():
+    assert format_gossip_messages("") == []
+
+
+def test_listing_shows_date_title_sender_and_image_count(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    _save(
+        workspace,
+        raw_text="显卡下周降价",
+        gist="显卡降价",
+        sender_display_name="旺旺雪饼",
+        media_paths=["/data/a.jpg", "/data/b.jpg"],
+        created_at="2026-10-09T10:38:56+08:00",
+    )
+
+    listing = format_gossip_listing(
+        list_gossip_headers(workspace, **_GROUP), title="屎库 · 本群 共 1 条"
+    )
+
+    assert listing.startswith("屎库 · 本群 共 1 条\n1. ")
+    assert "2026-10-09" in listing
+    assert "显卡降价" in listing
+    assert "旺旺雪饼" in listing
+    assert "2图" in listing
+
+
+def test_search_matches_chinese_by_character(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    _save(workspace, raw_text="显卡下周降价，旺旺雪饼说的", gist="显卡降价")
+    _save(workspace, raw_text="食堂今天有糖醋排骨", gist="食堂菜单")
+
+    hits = search_gossip(workspace, **_GROUP, query="显卡")
+
+    assert [header.description for header in hits] == ["显卡降价"]
+
+
+def test_search_can_match_the_body_not_just_the_gist(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    _save(workspace, raw_text="转发：新来的实习生叫阿岚", gist="人事变动")
+
+    hits = search_gossip(workspace, **_GROUP, query="阿岚")
+
+    assert len(hits) == 1
+
+
+def test_search_is_scoped_to_one_group(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    _save(workspace, raw_text="甲的显卡降价", gist="甲", channel="qq", chat_id="G1")
+    _save(workspace, raw_text="乙的显卡降价", gist="乙", channel="qq", chat_id="G2")
+
+    hits = search_gossip(workspace, channel="qq", chat_id="G1", query="显卡")
+
+    assert [header.description for header in hits] == ["甲"]
+
+
+def test_search_on_an_absent_group_returns_nothing(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+
+    assert search_gossip(workspace, channel="qq", chat_id="NEVER", query="显卡") == []
+
+
+def test_entry_lookup_accepts_the_id_or_the_filename(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+    saved = _save(workspace, raw_text="瓜", gist="瓜")
+    entry_id = list_gossip_headers(workspace, **_GROUP)[0].id
+
+    assert find_gossip_entry(workspace, **_GROUP, entry_id=entry_id) == saved.path
+    assert find_gossip_entry(workspace, **_GROUP, entry_id=saved.path.name) == saved.path
+
+
+def test_entry_lookup_never_escapes_the_group_or_the_archive(tmp_path: Path):
+    """The id arrives from the model, so it is a key, not a path."""
+    workspace = _workspace(tmp_path)
+    saved = _save(workspace, raw_text="瓜", gist="瓜")
+    (tmp_path / "secret.txt").write_text("不该被读出来", encoding="utf-8")
+
+    assert find_gossip_entry(workspace, **_GROUP, entry_id=str(tmp_path / "secret.txt")) is None
+    assert find_gossip_entry(workspace, **_GROUP, entry_id="../../etc/passwd") is None
+    assert find_gossip_entry(workspace, **_GROUP, entry_id="") is None
+    # A real entry of another group is not reachable through this one.
+    assert find_gossip_entry(workspace, channel="qq", chat_id="G_OTHER", entry_id=saved.path.name) is None
+
+
+def test_prompt_describes_the_reading_tools(tmp_path: Path):
+    workspace = _workspace(tmp_path)
+
+    prompt = load_gossip_prompt(workspace)
+
+    assert prompt is not None
+    assert "ohmo_list_gossip" in prompt
+    assert "ohmo_show_gossip" in prompt

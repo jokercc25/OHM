@@ -30,6 +30,9 @@ Three structural choices worth stating, because each one is load-bearing:
   free-form, so archiving needs no schema change -- and entries come out already
   legible to ``scan_memory_files``, which is exactly what phase 2's search will
   build on.
+
+Phase 2 reads that archive back out: :func:`load_gossip_entry` returns the
+stored original untouched, and :func:`search_gossip` finds entries by free text.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from openharness.memory.scan import scan_memory_files
+from openharness.memory.search import find_relevant_memories
 from openharness.memory.schema import (
     SCHEMA_VERSION,
     coerce_bool,
@@ -60,6 +64,7 @@ from openharness.memory.team import scan_for_secrets
 from openharness.memory.types import MemoryHeader
 from openharness.utils.file_lock import exclusive_file_lock
 from openharness.utils.fs import atomic_write_text
+from openharness.utils.helpers import split_message
 
 from ohmo.workspace import get_gossip_dir
 
@@ -82,11 +87,28 @@ _GIST_TRUNCATE_TO = 40
 _MAX_TITLE_CHARS = 60
 _SCAN_LIMIT = 500
 
+# Display bounds. QQ answers an inbound @-message with at most five passive
+# replies, and a turn already spends one on the "thinking" progress line before
+# any tool runs plus whatever the model says afterwards -- so the verbatim dump
+# gets the remainder. Going over the budget does not queue: the extra messages
+# are rejected outright, which loses the tail silently. A stated truncation is
+# the better failure.
+MAX_DISPLAY_MESSAGES = 3
+DISPLAY_CHUNK_CHARS = 1_800
+_LISTING_TITLE_CHARS = 40
+
 _UNSAFE_PATH_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 # Transcript furniture, skipped when falling back to the original for a gist.
 _SECTION_LINE_RE = re.compile(r"^=+\s*消息\s*\d+\s*=+$")
 _MESSAGE_MARKER = "[消息内容]"
+
+# Section headings ``compose_gossip_body`` writes. Reading them back is how the
+# original is recovered without a parser for anything else.
+_RAW_SECTION = "## 原文"
+_MEDIA_SECTION = "## 图片"
+_MEDIA_NOTE_SUFFIX = "（待视觉模型补描述）"
+_NO_TEXT_PLACEHOLDER = "（无文本）"
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,29 @@ class GossipSaveResult:
     gist: str
     duplicate: bool
     sensitive: bool
+
+
+@dataclass(frozen=True)
+class GossipEntry:
+    """One archived entry, read back off disk."""
+
+    path: Path
+    metadata: dict[str, Any]
+    raw_text: str
+    media_paths: tuple[str, ...]
+
+    @property
+    def id(self) -> str:
+        """Return the entry's archive id, empty for a hand-written file."""
+        return str(self.metadata.get("id") or "")
+
+    @property
+    def gist(self) -> str:
+        return str(self.metadata.get("description") or self.metadata.get("gist") or "")
+
+    @property
+    def created_at(self) -> str:
+        return str(self.metadata.get("created_at") or "")
 
 
 def safe_segment(raw: str, *, default: str = "unknown") -> str:
@@ -169,10 +214,10 @@ def compose_gossip_body(raw_text: str, media_paths: Sequence[str] = ()) -> str:
     that asymmetry is the whole reason the text is injected by the runtime
     instead of being passed in as a tool argument.
     """
-    lines = ["## 原文", "", raw_text.strip() or "（无文本）", ""]
+    lines = [_RAW_SECTION, "", raw_text.strip() or _NO_TEXT_PLACEHOLDER, ""]
     if media_paths:
-        lines.extend(["## 图片", ""])
-        lines.extend(f"- {path}（待视觉模型补描述）" for path in media_paths)
+        lines.extend([_MEDIA_SECTION, ""])
+        lines.extend(f"- {path}{_MEDIA_NOTE_SUFFIX}" for path in media_paths)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -290,6 +335,143 @@ def list_gossip_headers(
     )
 
 
+def find_gossip_entry(
+    workspace: str | Path | None,
+    *,
+    channel: str,
+    chat_id: str,
+    entry_id: str,
+) -> Path | None:
+    """Return the entry ``entry_id`` names inside one group's archive.
+
+    The lookup is a string comparison against this group's own scan -- never a
+    path join. ``entry_id`` reaches here from the model, and an argument that
+    resolved as a filesystem path would let it ask for any file on the box and
+    have the result published into the group.
+
+    The filename is accepted as well as the id so a hand-written entry, which
+    has no ``id`` in its frontmatter, is still reachable.
+    """
+    wanted = str(entry_id or "").strip()
+    if not wanted:
+        return None
+    for header in list_gossip_headers(
+        workspace,
+        channel=channel,
+        chat_id=chat_id,
+        include_disabled=True,
+        max_files=None,
+    ):
+        if (header.id and header.id == wanted) or header.path.name == wanted:
+            return header.path
+    return None
+
+
+def search_gossip(
+    workspace: str | Path | None,
+    *,
+    channel: str,
+    chat_id: str,
+    query: str,
+    limit: int = _SCAN_LIMIT,
+) -> list[MemoryHeader]:
+    """Return this group's entries overlapping ``query``, best match first.
+
+    Delegates to :func:`~openharness.memory.search.find_relevant_memories` so
+    the ranking (metadata hits weighted over body hits, plus importance and
+    recency) and the query tokenizer are the same ones the personal memory store
+    already uses -- including the per-Han-character split, which is what makes a
+    Chinese query work at all without a segmenter.
+    """
+    entries_dir = gossip_entries_dir(workspace, channel=channel, chat_id=chat_id)
+    if not entries_dir.is_dir():
+        return []
+    return find_relevant_memories(
+        query,
+        entries_dir,
+        max_results=limit,
+        memory_dir=entries_dir,
+        max_files=_SCAN_LIMIT,
+    )
+
+
+def list_gossip_groups(workspace: str | Path | None) -> list[tuple[str, str]]:
+    """Return ``(channel, chat_id)`` for every group with an archive on disk."""
+    gossip_root = get_gossip_dir(workspace)
+    groups: list[tuple[str, str]] = []
+    if not gossip_root.is_dir():
+        return groups
+    for channel_dir in sorted(path for path in gossip_root.iterdir() if path.is_dir()):
+        for group_dir in sorted(path for path in channel_dir.iterdir() if path.is_dir()):
+            groups.append((channel_dir.name, group_dir.name))
+    return groups
+
+
+def load_gossip_entry(path: str | Path) -> GossipEntry:
+    """Read one archived entry back, keeping its original text verbatim.
+
+    Read-only. The text is sliced out of the stored body without being
+    re-wrapped, re-indented or otherwise normalised: phase 1 wrote exactly what
+    the channel captured, and reproducing anything else would defeat the point
+    of having an archive.
+    """
+    entry_path = Path(path)
+    metadata, body, _, _ = split_memory_file(entry_path.read_text(encoding="utf-8"))
+    sections = _split_body_sections(body)
+    return GossipEntry(
+        path=entry_path,
+        metadata=metadata,
+        raw_text=sections.get(_RAW_SECTION, "").strip(),
+        media_paths=_parse_media_section(sections.get(_MEDIA_SECTION, "")),
+    )
+
+
+def format_gossip_listing(headers: Sequence[MemoryHeader], *, title: str) -> str:
+    """Render a numbered index of entries, newest first.
+
+    Only metadata is used, so listing costs no body reads. The numbering is what
+    the user refers back to ("看第 2 条"), which is why the display order and the
+    order of the ids handed to the model must come from one sequence.
+    """
+    lines = [title]
+    lines.extend(
+        f"{index}. {_listing_line(header)}" for index, header in enumerate(headers, start=1)
+    )
+    return "\n".join(lines)
+
+
+def format_gossip_body(entry: GossipEntry) -> str:
+    """Return the exact text to publish for one entry.
+
+    Images become placeholders rather than uploads: the archive stores local
+    paths, and QQ's group API takes only a public URL, so the group is told what
+    was attached instead of being shown it.
+    """
+    text = entry.raw_text
+    if not entry.media_paths:
+        return text
+    placeholders = "\n".join(
+        f"[图片{index}] {Path(path).name}"
+        for index, path in enumerate(entry.media_paths, start=1)
+    )
+    return f"{text}\n\n{placeholders}" if text else placeholders
+
+
+def format_gossip_messages(text: str) -> list[str]:
+    """Split entry text into the messages that will carry it.
+
+    Capped at :data:`MAX_DISPLAY_MESSAGES`, and the last one says so when the
+    cap bites. A silently short dump would read as the whole record.
+    """
+    chunks = split_message(text, DISPLAY_CHUNK_CHARS)
+    if len(chunks) <= MAX_DISPLAY_MESSAGES:
+        return chunks
+    kept = chunks[:MAX_DISPLAY_MESSAGES]
+    sent = sum(len(chunk) for chunk in kept)
+    kept[-1] = f"{kept[-1]}\n…（原文过长，已截断：共 {len(text)} 字，已发 {sent} 字）"
+    return kept
+
+
 def build_gossip_index(
     workspace: str | Path | None,
     *,
@@ -359,6 +541,12 @@ def load_gossip_prompt(workspace: str | Path | None = None) -> str | None:
             "这是别人以后检索的入口。",
             "- 不值得留就正常聊天，不要调用工具，也不要提屎库。",
             "- 存完只回一句极短的话（例如“记下了。”），不要复述内容。",
+            "- 有人问屎库里有什么、或者想找某件事时，调用 `ohmo_list_gossip`："
+            "它自己会把列表发到群里，你只要回一句极短的话（例如“上面就是。”），不要复述列表。",
+            "- 列表每条前面的序号和 id：用户说“看第 N 条”就调 `ohmo_show_gossip(index=N)`，"
+            "也可以把上一条列出来的 id 直接传给 `ohmo_show_gossip(id=...)`。id 更准，能用就用 id。",
+            "- `ohmo_show_gossip` 会把存档原文一字不改地发到群里。发完什么都不要再说："
+            "不要转述、不要复述、不要评论、不要加总结。",
         ]
     )
 
@@ -383,6 +571,62 @@ def _scan_entries(
         include_disabled=include_disabled,
         memory_dir=entries_dir,
     )
+
+
+def _split_body_sections(body: str) -> dict[str, str]:
+    """Split a stored body into its ``## `` sections, headings included.
+
+    A forwarded chat record can itself contain a line starting with ``## ``,
+    which would open a section that is not one. The damage is bounded: the text
+    is only ever put back together for display, and ``## 原文`` is always the
+    first heading ``compose_gossip_body`` writes.
+    """
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in body.splitlines():
+        if line.startswith("## "):
+            current = line.strip()
+            sections.setdefault(current, [])
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return {name: "\n".join(lines) for name, lines in sections.items()}
+
+
+def _parse_media_section(text: str) -> tuple[str, ...]:
+    """Return the attachment paths listed under ``## 图片``."""
+    paths: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- "):
+            continue
+        value = stripped[2:].strip()
+        if value.endswith(_MEDIA_NOTE_SUFFIX):
+            value = value[: -len(_MEDIA_NOTE_SUFFIX)].strip()
+        if value:
+            paths.append(value)
+    return tuple(paths)
+
+
+def _listing_line(header: MemoryHeader) -> str:
+    """Return one listing row: date, title, sender, attachment count.
+
+    The date is the stored one, sliced out of the UTC timestamp. Rendering a
+    clock time here would mean picking a timezone to lie about -- the container
+    runs UTC while the group does not.
+    """
+    date = header.created_at[:10] or header.updated_at[:10] or "----------"
+    parts = [date]
+    title = " ".join(str(header.title or header.description or "").split())
+    if title:
+        parts.append(title[:_LISTING_TITLE_CHARS])
+    sender = str(header.frontmatter.get("sender_display_name") or "").strip()
+    if sender:
+        parts.append(sender)
+    count = len(coerce_str_list(header.frontmatter.get("media")))
+    if count:
+        parts.append(f"{count}图")
+    return " ｜ ".join(parts)
 
 
 def _entry_title(title: str | None, gist: str) -> str:

@@ -3,6 +3,7 @@ import contextlib
 import logging
 import subprocess
 import sys
+from collections.abc import Sequence
 from types import SimpleNamespace
 from datetime import datetime
 import json
@@ -16,6 +17,7 @@ from openharness.autopilot.service import RepoAutopilotStore
 from openharness.bridge import get_bridge_manager
 from openharness.channels.bus.events import InboundMessage
 from openharness.channels.bus.queue import MessageBus
+from openharness.channels.impl.qq import QQ_MAX_MESSAGE_LEN
 from openharness.commands import CommandResult
 from openharness.commands.registry import SlashCommand, create_default_command_registry
 from openharness.config.paths import get_project_issue_file, get_project_pr_comments_file
@@ -38,12 +40,20 @@ from openharness.tools.base import ToolExecutionContext, ToolRegistry
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config, save_gateway_config
-from ohmo.gateway.gossip_tool import OhmoSaveGossipInput, OhmoSaveGossipTool
+from ohmo.gateway.gossip_tool import (
+    OhmoListGossipInput,
+    OhmoListGossipTool,
+    OhmoSaveGossipInput,
+    OhmoSaveGossipTool,
+    OhmoShowGossipInput,
+    OhmoShowGossipTool,
+)
 from ohmo.gateway.group_tool import OhmoCreateFeishuGroupInput, OhmoCreateFeishuGroupTool
 from ohmo.gateway.models import GatewayConfig, GatewayState
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
+    _QUIET_TOOL_NAMES,
     _build_inbound_user_message,
     _format_channel_progress,
     _sanitize_group_command_metadata,
@@ -55,7 +65,12 @@ from ohmo.group_registry import load_managed_group_record, save_managed_group_re
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
-from ohmo.gossip import gossip_entries_dir, list_gossip_headers
+from ohmo.gossip import (
+    MAX_DISPLAY_MESSAGES,
+    gossip_entries_dir,
+    list_gossip_headers,
+    save_gossip_entry,
+)
 from ohmo.session_storage import save_session_snapshot
 from ohmo.workspace import get_gateway_restart_notice_path, get_skills_dir, initialize_workspace
 
@@ -3660,3 +3675,327 @@ async def test_runtime_pool_stream_message_handles_ohmo_skill_slash_command(tmp_
     assert f"Base directory for this skill: {skill_dir.resolve()}" in submitted[0]
     assert "Summarize this: hello" in submitted[0]
     assert updates[-1].text == "skill-done"
+
+
+# --- gossip phase 2: listing and showing -------------------------------------
+
+
+class _Recorder:
+    """Records what a tool publishes to the group, standing in for the bus."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, str]] = []
+
+    def __call__(self, chat_id: str, content: str, channel: str) -> None:
+        self.sent.append((chat_id, content, channel))
+
+    @property
+    def content(self) -> str:
+        return "\n".join(text for _, text, _ in self.sent)
+
+
+def _seed(tmp_path: Path, *, raw_text: str, gist: str, media_paths: Sequence[str] = ()):
+    return save_gossip_entry(
+        tmp_path,
+        channel="qq",
+        chat_id="GROUP_OPENID_1",
+        raw_text=raw_text,
+        gist=gist,
+        media_paths=list(media_paths),
+    )
+
+
+def _read_context(**overrides: object) -> dict[str, object]:
+    """The metadata a reading tool sees: the request plus its hits container."""
+    metadata: dict[str, object] = {
+        "ohmo_gossip_request": _gossip_request(),
+        "ohmo_gossip_hits": {},
+    }
+    metadata.update(overrides)
+    return metadata
+
+
+@pytest.mark.asyncio
+async def test_ohmo_list_gossip_publishes_the_listing_and_numbers_the_ids(tmp_path):
+    _seed(tmp_path, raw_text="显卡下周降价", gist="显卡降价", media_paths=["/data/a.jpg"])
+    _seed(tmp_path, raw_text="食堂今天有糖醋排骨", gist="食堂菜单")
+    recorder = _Recorder()
+    tool = OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+    metadata = _read_context()
+
+    result = await tool.execute(
+        OhmoListGossipInput(),
+        ToolExecutionContext(cwd=tmp_path, metadata=metadata),
+    )
+
+    assert result.is_error is False
+    assert len(recorder.sent) == 1
+    chat_id, listing, channel = recorder.sent[0]
+    assert (chat_id, channel) == ("GROUP_OPENID_1", "qq")
+    assert "共 2 条" in listing
+    assert "食堂菜单" in listing and "显卡降价" in listing
+    # Attachments are counted, never inlined: the group is told an image exists.
+    assert "1图" in listing
+
+    # The model gets handles, not text: it never retypes what it cannot see.
+    headers = list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")
+    for index, header in enumerate(headers, start=1):
+        assert f"{index}={header.id}" in result.output
+    # The gist is fair game -- the model wrote it -- but the archived original is
+    # not, so it can never restate one from memory.
+    assert "食堂今天有糖醋排骨" not in result.output
+    # And the numbering reaches the next turn through the shared nested dict.
+    assert metadata["ohmo_gossip_hits"] == {
+        str(index): header.id for index, header in enumerate(headers, start=1)
+    }
+
+
+@pytest.mark.asyncio
+async def test_ohmo_list_gossip_searches_instead_of_listing_everything(tmp_path):
+    _seed(tmp_path, raw_text="显卡下周降价", gist="显卡降价")
+    _seed(tmp_path, raw_text="食堂今天有糖醋排骨", gist="食堂菜单")
+    recorder = _Recorder()
+    tool = OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    result = await tool.execute(
+        OhmoListGossipInput(query="显卡"),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert result.is_error is False
+    assert "显卡降价" in recorder.content
+    assert "食堂菜单" not in recorder.content
+    assert "共 1 条" in recorder.content
+
+
+@pytest.mark.asyncio
+async def test_ohmo_list_gossip_on_an_empty_archive_says_so_without_publishing(tmp_path):
+    recorder = _Recorder()
+    tool = OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    result = await tool.execute(
+        OhmoListGossipInput(),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert result.is_error is False
+    assert recorder.sent == []
+    assert "空的" in result.output
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_publishes_the_original_verbatim(tmp_path):
+    """The one assertion this whole feature exists for.
+
+    The group gets the archived bytes, not a model's account of them: nothing
+    between the store and the outbound message rewrites the text.
+    """
+    original = "=== 消息 2 ===\n[消息内容] [群聊的聊天记录]\n--- 第1条 ---\n    [消息内容] 显卡下周降价"
+    saved = _seed(tmp_path, raw_text=original, gist="显卡降价")
+    recorder = _Recorder()
+    tool = OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    result = await tool.execute(
+        OhmoShowGossipInput(id=list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")[0].id),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert result.is_error is False
+    assert recorder.sent == [("GROUP_OPENID_1", original, "qq")]
+    assert saved.path.name not in recorder.content
+    # The model is told it is done, and told the text is not its business.
+    assert original not in result.output
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_marks_images_instead_of_sending_them(tmp_path):
+    """QQ's group API takes a public URL and botpy exposes no upload for bytes."""
+    saved = _seed(tmp_path, raw_text="带图的瓜", gist="带图的瓜", media_paths=["/data/IMG_1_a.jpg"])
+    recorder = _Recorder()
+    tool = OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    await tool.execute(
+        OhmoShowGossipInput(id=list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")[0].id),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert saved.path.exists()
+    assert recorder.content == "带图的瓜\n\n[图片1] IMG_1_a.jpg"
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_resolves_an_index_from_the_previous_listing(tmp_path):
+    _seed(tmp_path, raw_text="第一条", gist="第一条")
+    _seed(tmp_path, raw_text="第二条", gist="第二条")
+    recorder = _Recorder()
+    metadata = _read_context()
+
+    await OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=recorder).execute(
+        OhmoListGossipInput(),
+        ToolExecutionContext(cwd=tmp_path, metadata=metadata),
+    )
+    result = await OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder).execute(
+        OhmoShowGossipInput(index=2),
+        ToolExecutionContext(cwd=tmp_path, metadata=metadata),
+    )
+
+    assert result.is_error is False
+    # Newest first, so number 2 is the older entry.
+    assert recorder.sent[-1][1] == "第一条"
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_without_a_listing_tells_the_model_to_list(tmp_path):
+    """A restart drops tool_metadata; the failure has to be actionable."""
+    _seed(tmp_path, raw_text="瓜", gist="瓜")
+    recorder = _Recorder()
+    tool = OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    result = await tool.execute(
+        OhmoShowGossipInput(index=1),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context(ohmo_gossip_hits={})),
+    )
+
+    assert result.is_error is True
+    assert "ohmo_list_gossip" in result.output
+    assert recorder.sent == []
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_refuses_a_path_shaped_id(tmp_path):
+    """An id from the model is a lookup key, never something to open."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("不该出现在群里", encoding="utf-8")
+    _seed(tmp_path, raw_text="瓜", gist="瓜")
+    recorder = _Recorder()
+    tool = OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    result = await tool.execute(
+        OhmoShowGossipInput(id=str(secret)),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert result.is_error is True
+    assert recorder.sent == []
+
+
+@pytest.mark.asyncio
+async def test_ohmo_show_gossip_splits_a_long_entry_within_the_reply_budget(tmp_path):
+    _seed(tmp_path, raw_text="字" * 6000, gist="很长的瓜")
+    recorder = _Recorder()
+    tool = OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=recorder)
+
+    await tool.execute(
+        OhmoShowGossipInput(id=list_gossip_headers(tmp_path, channel="qq", chat_id="GROUP_OPENID_1")[0].id),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert len(recorder.sent) == MAX_DISPLAY_MESSAGES
+    # Each chunk has to survive one QQ send, and the truncation has to be said
+    # out loud -- a silently short dump reads as the whole record.
+    assert all(len(text) <= QQ_MAX_MESSAGE_LEN for _, text, _ in recorder.sent)
+    assert "已截断" in recorder.content
+    assert "6000" in recorder.content
+
+
+@pytest.mark.asyncio
+async def test_ohmo_gossip_read_tools_refuse_outside_a_qq_group(tmp_path):
+    for tool in (
+        OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=_Recorder()),
+        OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=_Recorder()),
+    ):
+        arguments = (
+            OhmoListGossipInput() if isinstance(tool, OhmoListGossipTool) else OhmoShowGossipInput(id="x")
+        )
+        result = await tool.execute(arguments, ToolExecutionContext(cwd=tmp_path, metadata={}))
+        assert result.is_error is True
+        assert "QQ 群" in result.output
+
+
+@pytest.mark.asyncio
+async def test_ohmo_gossip_read_tool_results_never_carry_media_keys(tmp_path):
+    """``media`` / ``paths`` in a tool result spend another passive reply."""
+    _seed(tmp_path, raw_text="带图的瓜", gist="带图的瓜", media_paths=["/data/a.jpg"])
+    metadata = _read_context()
+    listed = await OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=_Recorder()).execute(
+        OhmoListGossipInput(),
+        ToolExecutionContext(cwd=tmp_path, metadata=metadata),
+    )
+    shown = await OhmoShowGossipTool(workspace=tmp_path, publish_gossip_text=_Recorder()).execute(
+        OhmoShowGossipInput(index=1),
+        ToolExecutionContext(cwd=tmp_path, metadata=metadata),
+    )
+
+    for result in (listed, shown):
+        assert "media" not in result.metadata
+        assert "paths" not in result.metadata
+
+
+@pytest.mark.asyncio
+async def test_ohmo_list_gossip_awaits_an_async_publisher(tmp_path):
+    """The gateway's publisher is a coroutine function; a sync one is allowed too."""
+    _seed(tmp_path, raw_text="瓜", gist="瓜")
+    sent: list[str] = []
+
+    async def publish(chat_id: str, content: str, channel: str) -> None:
+        sent.append(content)
+
+    result = await OhmoListGossipTool(workspace=tmp_path, publish_gossip_text=publish).execute(
+        OhmoListGossipInput(),
+        ToolExecutionContext(cwd=tmp_path, metadata=_read_context()),
+    )
+
+    assert result.is_error is False
+    assert len(sent) == 1
+
+
+def test_runtime_pool_registers_the_gossip_read_tools(tmp_path):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    bundle = SimpleNamespace(engine=SimpleNamespace(tool_metadata={}), tool_registry=ToolRegistry())
+
+    pool._register_gateway_tools(bundle)
+
+    registered = {tool for tool in ("ohmo_save_gossip", "ohmo_list_gossip", "ohmo_show_gossip")}
+    assert all(bundle.tool_registry.get(name) is not None for name in registered)
+    # Registering twice must not double up: the tools array is sent every request.
+    pool._register_gateway_tools(bundle)
+    assert all(bundle.tool_registry.get(name) is not None for name in registered)
+
+
+def test_gossip_read_tool_names_are_kept_out_of_the_progress_stream(tmp_path):
+    """A hint would announce the tool and then the tool's own message, for two
+    of the five passive replies a QQ group turn has."""
+    assert {"ohmo_save_gossip", "ohmo_list_gossip", "ohmo_show_gossip"} <= _QUIET_TOOL_NAMES
+
+
+def test_runtime_pool_creates_the_gossip_hits_container_for_qq_groups(tmp_path):
+    workspace = initialize_workspace(tmp_path / ".ohmo-home")
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    engine = SimpleNamespace(tool_metadata={})
+    bundle = SimpleNamespace(engine=engine, tool_registry=ToolRegistry())
+
+    pool._set_gossip_request_context(
+        bundle,
+        InboundMessage(
+            channel="qq",
+            sender_id="GROUP_OPENID_1|U1",
+            chat_id="GROUP_OPENID_1",
+            content="看看这个",
+            metadata={"chat_type": "group"},
+        ),
+        "qq:GROUP_OPENID_1|U1",
+    )
+
+    hits = engine.tool_metadata["ohmo_gossip_hits"]
+    assert hits == {}
+    # The request is dropped between turns; the numbering is not, because the
+    # whole point is that "看第 2 条" still resolves on the next message.
+    pool._restore_gossip_request_context(bundle)
+    assert "ohmo_gossip_request" not in engine.tool_metadata
+    assert engine.tool_metadata["ohmo_gossip_hits"] is hits
+
+    # A tool context is a shallow copy, so only a nested mutation gets through.
+    metadata = dict(engine.tool_metadata)
+    metadata["ohmo_gossip_hits"]["1"] = "mem-1"
+    assert engine.tool_metadata["ohmo_gossip_hits"] == {"1": "mem-1"}

@@ -34,7 +34,12 @@ from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
 from ohmo.gateway.config import load_gateway_config
-from ohmo.gateway.gossip_tool import OhmoSaveGossipTool
+from ohmo.gateway.gossip_tool import (
+    OhmoListGossipTool,
+    OhmoSaveGossipTool,
+    OhmoShowGossipTool,
+    PublishGossipText,
+)
 from ohmo.gateway.group_tool import CreateFeishuGroup, OhmoCreateFeishuGroupTool, PublishGroupWelcome
 from ohmo.gateway.provider_commands import handle_gateway_model_command, handle_gateway_provider_command
 from ohmo.group_registry import load_managed_group_record, normalize_cwd
@@ -75,13 +80,19 @@ _IMAGE_FALLBACK_NOTE = (
 _NO_GROUP_REQUEST = object()
 _GROUP_TOOL_NAME = "ohmo_create_feishu_group"
 _GOSSIP_TOOL_NAME = "ohmo_save_gossip"
+_LIST_GOSSIP_TOOL_NAME = "ohmo_list_gossip"
+_SHOW_GOSSIP_TOOL_NAME = "ohmo_show_gossip"
 
 # Tools whose progress hints are never sent to the channel. A hint carries the
 # tool input, and the gossip tool's input is the gist -- putting it in the group
 # would spend a passive-reply slot to spoil the summary the user is about to get
-# anyway. Keeping this list lets QQ turn progress hints back on for every other
-# tool without leaking this one.
-_QUIET_TOOL_NAMES = frozenset({_GOSSIP_TOOL_NAME})
+# anyway. For the two reading tools the hint is worse than noise: they publish
+# their own output to the group, so "using ohmo_list_gossip" would arrive
+# immediately before the listing itself and burn a slot out of a budget of five.
+# Keeping this list lets QQ turn progress hints back on for every other tool.
+_QUIET_TOOL_NAMES = frozenset(
+    {_GOSSIP_TOOL_NAME, _LIST_GOSSIP_TOOL_NAME, _SHOW_GOSSIP_TOOL_NAME}
+)
 _GROUP_AGENT_PROMPT_PREFIX = "The user invoked `/group` from a Feishu private chat."
 _GROUP_AGENT_PROMPT_REQUEST_MARKER = "User /group request:"
 _GROUP_METADATA_KEYS = (
@@ -116,6 +127,7 @@ class OhmoSessionRuntimePool:
         max_turns: int | None = None,
         create_feishu_group: CreateFeishuGroup | None = None,
         publish_group_welcome: PublishGroupWelcome | None = None,
+        publish_gossip_text: PublishGossipText | None = None,
     ) -> None:
         self._cwd = str(Path(cwd).resolve())
         self._workspace = workspace
@@ -124,6 +136,7 @@ class OhmoSessionRuntimePool:
         self._max_turns = max_turns
         self._create_feishu_group = create_feishu_group
         self._publish_group_welcome = publish_group_welcome
+        self._publish_gossip_text = publish_gossip_text
         self._workspace = initialize_workspace(workspace)
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
@@ -748,23 +761,36 @@ class OhmoSessionRuntimePool:
         self._register_gossip_tool(bundle)
 
     def _register_gossip_tool(self, bundle: RuntimeBundle) -> None:
-        """Register the gossip tool for the lifetime of the bundle.
+        """Register the gossip tools for the lifetime of the bundle.
 
         Registered once and left alone, unlike the Feishu group tool. Two
-        reasons: the prompt section describing it is channel-independent and is
-        assembled for every session, so a tool that only appeared on QQ group
+        reasons: the prompt section describing them is channel-independent and
+        is assembled for every session, so a tool that only appeared on QQ group
         turns would leave the model told about a tool it cannot see; and the
         tools array is sent on every request, so registering and unregistering
         per turn would invalidate the provider's cached tools prefix each time.
 
-        Safety comes from the context guard instead: the tool no-ops unless the
+        Safety comes from the context guard instead: each tool no-ops unless the
         runtime injected a QQ group request for the current turn, and a stale
         registration is therefore harmless.
         """
         registry = getattr(bundle, "tool_registry", None)
-        if registry is None or registry.get(_GOSSIP_TOOL_NAME) is not None:
+        if registry is None:
             return
-        registry.register(OhmoSaveGossipTool(workspace=self._workspace))
+        tools = (
+            OhmoSaveGossipTool(workspace=self._workspace),
+            OhmoListGossipTool(
+                workspace=self._workspace,
+                publish_gossip_text=self._publish_gossip_text,
+            ),
+            OhmoShowGossipTool(
+                workspace=self._workspace,
+                publish_gossip_text=self._publish_gossip_text,
+            ),
+        )
+        for tool in tools:
+            if registry.get(tool.name) is None:
+                registry.register(tool)
 
     def _register_group_tool(self, bundle: RuntimeBundle) -> None:
         if self._create_feishu_group is None or not hasattr(bundle, "tool_registry"):
@@ -839,6 +865,12 @@ class OhmoSessionRuntimePool:
         if message.channel != "qq" or str(message.metadata.get("chat_type") or "").lower() != "group":
             metadata.pop("ohmo_gossip_request", None)
             return
+        # A stable, empty container for "which entry was number N" -- the reading
+        # tool fills it in place. It has to exist before the tool runs: the tool
+        # context carries a shallow copy of this dict, so an assignment made
+        # there is discarded while a mutation of a nested dict survives. Not
+        # popped with the request below, so the numbering outlives the turn.
+        metadata.setdefault("ohmo_gossip_hits", {})
         metadata["ohmo_gossip_request"] = {
             "channel": message.channel,
             "chat_id": str(message.chat_id),
