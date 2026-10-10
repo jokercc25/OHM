@@ -1,0 +1,46 @@
+src/openharness/channels/impl/qq.py
+  s_b4325cc4699024::t_abfedc33d01e79 28
+  s_b4325cc4699024::t_3e6d7364207802 334-339,344
+  s_b4325cc4699024::t_40e5e425048002 67-72
+  s_b4325cc4699024::t_2503cb441b8c38 304-310,316-318,323-324,327,331-333,340-343,345-365,376-382
+tests/test_channels/test_qq_media_download.py
+  s_b4325cc4699024::t_a3f50c7452679e 24-39,42-47,49
+  s_b4325cc4699024::t_7e3c5db5e38f25 85,90,92-122,129,142-158
+  s_b4325cc4699024::t_5ec8e5e4fb69c0 241
+  s_b4325cc4699024::t_21751a1f352c16 191
+  s_b4325cc4699024::t_73b27b1e91b804 258
+src/openharness/utils/helpers.py
+  s_b4325cc4699024::t_dd60bb6533302c 69-113
+  s_b4325cc4699024::t_720723755525ed 16-22
+tests/test_ohmo/test_gateway.py
+  s_b4325cc4699024::t_a7ee37c5784123 51
+  s_b4325cc4699024::t_1556a3d031ac60 1691-1711,1717,1722-1749
+  s_b4325cc4699024::t_cf9184e1922a55 1712-1716,1718-1721
+tests/test_engine/test_messages.py
+  s_b4325cc4699024::t_c199e9cfa2c9a8 57-101
+  s_b4325cc4699024::t_006feb8e0675bf 3-7,10,17-21
+tests/test_utils/test_helpers.py
+  s_b4325cc4699024::t_fed86f9b3e8202 5-13
+  s_b4325cc4699024::t_9fb7121d3420d0 44-78
+src/openharness/engine/messages.py
+  s_b4325cc4699024::t_661ed0a08143af 32-40,42-44,46
+  s_b4325cc4699024::t_5695db95fcf487 12
+ohmo/gateway/runtime.py
+  s_b4325cc4699024::t_1697fd04736bb8 1161-1170
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "5801b41a06f670d0fdd69a6b7fff05b3f8e624e6",
+  "prompts": {},
+  "sessions": {
+    "s_b4325cc4699024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4ad383c-9b97-44b8-9215-87896cb50d3a",
+        "model": "deepseek-flash"
+      },
+      "human_author": "zhenglixin.11 <zhenglixin.11@jd.com>"
+    }
+  }
+}
