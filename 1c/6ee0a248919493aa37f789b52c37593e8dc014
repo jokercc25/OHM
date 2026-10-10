@@ -1,0 +1,44 @@
+tests/test_channels/test_qq_rich.py
+  s_b4325cc4699024::t_4a8634f7f2c18d 20
+  s_b4325cc4699024::t_a4fd0f0a53d93f 116-124,129,131-138
+  s_b4325cc4699024::t_c655b5fd517475 125-128,130
+ohmo/gateway/gossip_tool.py
+  s_b4325cc4699024::t_0dfb927dc9777d 189,194-195,198-202,206-207,211,218-219
+  s_b4325cc4699024::t_6d382fd6309ec7 174-180,182,184-188,190-193,203-205,208-210
+  s_b4325cc4699024::t_8f5ab0d0d6fbad 55-58,64-66,71-74,78
+tests/test_ohmo/test_gateway.py
+  s_b4325cc4699024::t_7c68054b6a53d9 2526,2545-2593
+  s_b4325cc4699024::t_c4d2312d3e8faa 2597-2610
+  s_b4325cc4699024::t_95d5a1bbc7c5e7 2657
+ohmo/prompts.py
+  s_b4325cc4699024::t_572355ba14ec16 28-42
+  s_b4325cc4699024::t_b432ca9df64d06 82-83
+ohmo/gossip.py
+  s_b4325cc4699024::t_1e12ebc3691be0 542-543
+src/openharness/channels/impl/qq_rich.py
+  s_b4325cc4699024::t_c1ca1c5ab4e480 80-83
+  s_b4325cc4699024::t_17264cf33d9796 205-230
+src/openharness/channels/impl/qq.py
+  s_b4325cc4699024::t_8ee4d45490e9e2 507-516
+  s_b4325cc4699024::t_d214f1a38c29fb 22
+tests/test_ohmo/test_prompts.py
+  s_b4325cc4699024::t_b30f145b205f77 40-43
+tests/test_channels/test_qq_media_download.py
+  s_b4325cc4699024::t_445e53d1cdee5e 266-268,273-275
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "1c6ee0a248919493aa37f789b52c37593e8dc014",
+  "prompts": {},
+  "sessions": {
+    "s_b4325cc4699024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4ad383c-9b97-44b8-9215-87896cb50d3a",
+        "model": "deepseek-flash"
+      },
+      "human_author": "zhenglixin.11 <zhenglixin.11@jd.com>"
+    }
+  }
+}
