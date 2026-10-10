@@ -37,6 +37,10 @@ def test_ohmo_prompt_includes_persona_and_memory(tmp_path: Path):
     assert "UTC timestamps" in prompt
     assert "屎库" in prompt
     assert "ohmo_save_gossip" in prompt
+    # QQ hands over the recent group messages with every @-mention; the model
+    # has to be told they are background, not the person talking to it.
+    assert "[群聊转写" in prompt
+    assert "不是用户在跟你说话" in prompt
 
 
 def test_ohmo_runtime_prompt_can_exclude_project_memory(tmp_path: Path, monkeypatch):

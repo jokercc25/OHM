@@ -17,6 +17,7 @@ from openharness.channels.impl.qq_rich import (
     census,
     extract_media_refs,
     flatten_group_payload,
+    frame_transcript,
     redact_payload,
     rewrite_media_links,
     safe_attachment_name,
@@ -110,6 +111,29 @@ def test_split_transcript_without_markers_yields_nothing():
     """No markers means nothing was quoted -- not one giant segment."""
     assert split_transcript("就是一段普通的话，没有分节标记") == ()
     assert split_transcript("") == ()
+
+
+def test_frame_transcript_marks_the_transcript_as_background():
+    framed = frame_transcript(_FORWARD_TRANSCRIPT)
+
+    assert framed.startswith("[群聊转写 · ")
+    assert "3 条" in framed
+    # The transcript itself is untouched: only a marker was added in front.
+    assert framed.endswith(_FORWARD_TRANSCRIPT)
+
+
+def test_the_marker_is_not_a_message_section():
+    """Segments are archived verbatim, so a marker parsed as one would be
+    filed as content. Framing must leave the segmentation alone."""
+    framed = frame_transcript(_FORWARD_TRANSCRIPT)
+
+    assert split_transcript(framed) == split_transcript(_FORWARD_TRANSCRIPT)
+
+
+def test_framing_without_sections_changes_nothing():
+    """An unrecognisable transcript is not something to annotate."""
+    assert frame_transcript("就是一段普通的话") == "就是一段普通的话"
+    assert frame_transcript("") == ""
 
 
 def test_image_url_is_extracted_from_transcript():

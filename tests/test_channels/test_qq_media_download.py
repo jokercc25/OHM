@@ -263,12 +263,16 @@ async def test_group_message_carries_local_paths_instead_of_expiring_urls(_media
     # them verbatim, so a live URL there lands in the store untouched.
     assert "rkey" not in inbound.content
     assert "SECRET" not in json.dumps(inbound.metadata, ensure_ascii=False)
-    # The @-mention is stripped before the message is handed on.
-    assert inbound.content.startswith("看看这个\n\n=== 消息 1 ===")
+    # The @-mention is stripped, and the transcript is marked as background
+    # rather than handed over as if the sender had said it.
+    assert inbound.content.startswith("看看这个\n\n[群聊转写 · ")
     assert inbound.metadata["sender_display_name"] == "调皮的小男孩"
     segments = inbound.metadata["qq_segments"]
     assert [segment["index"] for segment in segments] == [1, 2, 3]
     assert path in segments[1]["content"]
+    # The marker is a message-layer annotation only. A segment is archived word
+    # for word, so a marker reaching one would be filed away as content.
+    assert all("群聊转写" not in segment["content"] for segment in segments)
 
 
 @pytest.mark.asyncio

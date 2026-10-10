@@ -25,6 +25,21 @@ def _read_text(path: Path) -> str | None:
     return content or None
 
 
+# QQ attaches a transcript of the recent group messages to every @-mention.
+# Without this, the model reads five unrelated messages as the person talking to
+# it -- it answers them, and the gossip tool files them. The marker itself is
+# added by the channel (``qq_rich.frame_transcript``); this says how to read it.
+_TRANSCRIPT_SECTION = "\n".join(
+    [
+        "# QQ 群聊转写",
+        "- @ 你的时候，QQ 会在用户的话后面附上最近的群聊记录，以 `[群聊转写 · …]` 开头。",
+        "- 那一行之后的内容是群聊背景，不是用户在跟你说话：不要针对它作答，不要评论它。",
+        "- 用户的请求只有 `[群聊转写 · …]` 之前的那部分。没有这个标记时，整条消息都是用户发的。",
+        "- 除非用户明确提到屎库、或让你留档，否则完全忽略那段转写。",
+    ]
+)
+
+
 def build_ohmo_system_prompt(
     cwd: str | Path,
     *,
@@ -63,6 +78,8 @@ def build_ohmo_system_prompt(
             "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
         ]
     )
+
+    sections.append(_TRANSCRIPT_SECTION)
 
     if ohmo_memory := load_ohmo_memory_prompt(root):
         sections.append(ohmo_memory)

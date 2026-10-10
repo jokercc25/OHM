@@ -52,22 +52,30 @@ class OhmoSaveGossipInput(BaseModel):
     """Arguments selected by the model for archiving one piece of gossip."""
 
     gist: str = Field(
-        description="一句中文主旨（不超过 40 字），写清“谁、什么事”。这是别人以后检索的入口。"
+        description=(
+            "一句中文主旨（不超过 40 字），写清“谁、什么事”。这是别人以后检索的入口。"
+            "只描述 which 选中的那一条，绝不要概括整段群聊转写。"
+        )
     )
     which: int | None = Field(
         default=None,
         description=(
             "要存档的是群聊转写里第几条，即 “=== 消息 N ===” 的 N。"
-            "只存其中一条时必填；省略表示存档整段转写。"
+            "转写里有多条时必填——它们多半是 @ 你之前群里各说各的，"
+            "整段存会把不相干的也存进去。转写只有一条时可以省略（就存那条）；"
+            "没有转写时省略（存用户自己说的话）。"
         ),
     )
     title: str | None = Field(
         default=None,
-        description="可选短标题（不超过 20 字）。省略则直接用主旨当标题。",
+        description=(
+            "可选短标题（不超过 20 字）。省略则直接用主旨当标题。"
+            "同样只描述 which 选中的那一条。"
+        ),
     )
     tags: list[str] = Field(
         default_factory=list,
-        description="可选标签，2-4 个词，便于以后按主题找。",
+        description="可选标签，2-4 个词，便于以后按主题找。同样只描述选中的那一条。",
     )
     importance: int = Field(
         default=1,
@@ -163,26 +171,52 @@ def _select_source(request: Mapping[str, Any], which: int | None) -> tuple[str, 
     runtime injected. That split is the whole design -- the model is allowed to
     summarise, but it never gets to hand us the original, so what lands in the
     archive is exactly what QQ sent.
-    """
-    if which is None:
-        return str(request.get("raw_text") or ""), None
 
-    segments = request.get("segments")
-    if not isinstance(segments, list) or not segments:
+    ``which`` is how *one* message is named. Omitting it does not mean "all of
+    them": QQ attaches its transcript of the recent group messages to every
+    @-mention, so "all of them" is how five unrelated messages end up filed as
+    a single entry. A transcript of exactly one section is unambiguous -- that
+    is the forwarded card the sender is pointing at -- and several need the
+    model to say which.
+    """
+    segments = _usable_segments(request)
+    if which is None:
+        if not segments:
+            # No transcript at all, so this is the sender's own words and the
+            # inbound text carries no transcript marker.
+            return str(request.get("raw_text") or ""), None
+        if len(segments) > 1:
+            available = "、".join(str(index) for index, _ in segments)
+            return "", (
+                f"这条消息带着 {len(segments)} 条群聊转写，整段存会把不相干的也存进去。"
+                f"用 which 指明要存哪一条，可选：{available}。"
+            )
+        which = segments[0][0]
+    elif not segments:
         return "", "这条消息里没有可指认的编号（没有收到群聊转写）。"
 
-    available: list[str] = []
+    for index, content in segments:
+        if index == which:
+            return content, None
+
+    available = "、".join(str(index) for index, _ in segments) or "无"
+    return "", f"没有第 {which} 条。可选的编号：{available}。"
+
+
+def _usable_segments(request: Mapping[str, Any]) -> list[tuple[int, str]]:
+    """Return the injected transcript sections as ``(index, body)`` pairs."""
+    segments = request.get("segments")
+    if not isinstance(segments, list):
+        return []
+    usable: list[tuple[int, str]] = []
     for segment in segments:
         if not isinstance(segment, Mapping):
             continue
         index = segment.get("index")
         if not isinstance(index, int):
             continue
-        available.append(str(index))
-        if index == which:
-            return str(segment.get("content") or ""), None
-
-    return "", f"没有第 {which} 条。可选的编号：{'、'.join(available) or '无'}。"
+        usable.append((index, str(segment.get("content") or "")))
+    return usable
 
 
 class OhmoListGossipInput(BaseModel):

@@ -19,6 +19,7 @@ from openharness.channels.impl.qq_rich import (
     MediaRef,
     census,
     flatten_group_payload,
+    frame_transcript,
     rewrite_media_links,
     safe_attachment_name,
     split_transcript,
@@ -498,11 +499,21 @@ class QQChannel(BaseChannel):
             if rich.media:
                 transcript = rewrite_media_links(transcript, saved)
 
-            content = f"{typed}\n\n{transcript}" if typed and transcript else (typed or transcript)
             # Segments are re-split from the *rewritten* transcript: the gossip
             # tool archives a segment verbatim, so a stale rkey URL reaching
             # `metadata["qq_segments"]` would be written straight into the store.
             segments = split_transcript(transcript)
+
+            # The transcript is background, not the person talking: five
+            # unrelated group messages arriving as the user's own words is what
+            # made the model answer them and the archive swallow them. Mark it
+            # so. It is only the message itself when the sender typed nothing --
+            # a forwarded card -- and then a marker saying "not the user" would
+            # invite the model to ignore the very thing it was sent.
+            if typed and transcript:
+                content = f"{typed}\n\n{frame_transcript(transcript)}"
+            else:
+                content = typed or transcript
 
             # Remember this chat as a group so send() routes to post_group_message,
             # and stash the message id so passive group replies can echo msg_id.

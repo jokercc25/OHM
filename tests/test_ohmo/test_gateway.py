@@ -2523,7 +2523,7 @@ def _gossip_request(**overrides: object) -> dict[str, object]:
 async def test_ohmo_save_gossip_tool_writes_an_entry(tmp_path):
     tool = OhmoSaveGossipTool(workspace=tmp_path)
     result = await tool.execute(
-        OhmoSaveGossipInput(gist="旺旺雪饼转发：显卡下周降价", tags=["显卡"], importance=2),
+        OhmoSaveGossipInput(gist="旺旺雪饼转发：显卡下周降价", which=2, tags=["显卡"], importance=2),
         ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": _gossip_request()}),
     )
 
@@ -2540,6 +2540,72 @@ async def test_ohmo_save_gossip_tool_writes_an_entry(tmp_path):
     # The archived text is the runtime's copy, not anything the model wrote.
     assert "[发送者] 旺旺雪饼" in body
     assert "旺旺雪饼转发：显卡下周降价" not in body
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_refuses_to_file_a_whole_transcript(tmp_path):
+    """Omitting `which` is not "store all of them".
+
+    The transcript is whatever the group happened to say before the @-mention,
+    so filing it whole is how several unrelated messages become one entry.
+    """
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="随便"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": _gossip_request()}),
+    )
+
+    assert result.is_error is True
+    assert "2 条" in result.output
+    assert "1、2" in result.output
+    assert not gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").exists()
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_stores_the_only_segment_without_being_told(tmp_path):
+    """One section is unambiguous: it is the card the sender is pointing at."""
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    only = _gossip_request(segments=[{"index": 1, "content": "[消息内容] 显卡下周降价"}])
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="显卡下周降价"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": only}),
+    )
+
+    assert result.is_error is False
+    entry = next(gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").glob("*.md"))
+    _, body, _, _ = split_memory_file(entry.read_text(encoding="utf-8"))
+    assert "[消息内容] 显卡下周降价" in body
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_falls_back_to_the_sender_without_a_transcript(tmp_path):
+    """No transcript means no marker, so the inbound text is the sender's own."""
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    bare = _gossip_request(segments=[], raw_text="记住：显卡下周降价")
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="显卡下周降价"),
+        ToolExecutionContext(cwd=tmp_path, metadata={"ohmo_gossip_request": bare}),
+    )
+
+    assert result.is_error is False
+    entry = next(gossip_entries_dir(tmp_path, channel="qq", chat_id="GROUP_OPENID_1").glob("*.md"))
+    _, body, _, _ = split_memory_file(entry.read_text(encoding="utf-8"))
+    assert "记住：显卡下周降价" in body
+
+
+@pytest.mark.asyncio
+async def test_ohmo_save_gossip_tool_rejects_an_index_without_a_transcript(tmp_path):
+    tool = OhmoSaveGossipTool(workspace=tmp_path)
+    result = await tool.execute(
+        OhmoSaveGossipInput(gist="随便", which=1),
+        ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={"ohmo_gossip_request": _gossip_request(segments=[], raw_text="记住：显卡下周降价")},
+        ),
+    )
+
+    assert result.is_error is True
+    assert "没有收到群聊转写" in result.output
 
 
 @pytest.mark.asyncio
@@ -2588,7 +2654,7 @@ async def test_ohmo_save_gossip_tool_result_never_carries_media_keys(tmp_path):
     """``media`` / ``paths`` in a tool result spend another passive reply."""
     tool = OhmoSaveGossipTool(workspace=tmp_path)
     result = await tool.execute(
-        OhmoSaveGossipInput(gist="带图的瓜"),
+        OhmoSaveGossipInput(gist="带图的瓜", which=2),
         ToolExecutionContext(
             cwd=tmp_path,
             metadata={"ohmo_gossip_request": _gossip_request(media=["/workspace/attachments/qq/a.jpg"])},
