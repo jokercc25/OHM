@@ -1,0 +1,55 @@
+tests/test_ohmo/test_gossip.py
+  s_b4325cc4699024::t_84a87709c6c797 10-11,15-18,24,28
+  s_b4325cc4699024::t_0de6dd5f3ac61d 307-359,361-375,377-379,381-484
+  s_b4325cc4699024::t_cf003911642ecb 376,380
+  s_b4325cc4699024::t_262c62f7438587 360
+ohmo/gateway/service.py
+  s_b4325cc4699024::t_2fabe097ac658d 62
+  s_b4325cc4699024::t_09ba5663c0a19e 153-166
+ohmo/gateway/gossip_tool.py
+  s_b4325cc4699024::t_ff2a87f74e7255 418
+  s_b4325cc4699024::t_e5bb9b8f88ce8c 1,4-12,28-37,41-48
+  s_b4325cc4699024::t_672fb21ae981e8 186-417,419-430,432-476
+  s_b4325cc4699024::t_c1c6e4f80be9ff 19,25
+  s_b4325cc4699024::t_2635f8f9592d9e 431
+ohmo/gossip.py
+  s_b4325cc4699024::t_6d2f7ebed5b137 576-629
+  s_b4325cc4699024::t_6dff412caced52 544-549
+  s_b4325cc4699024::t_9f5f2ff4508509 338-472
+  s_b4325cc4699024::t_3bfa13af729cf4 217,219-220
+  s_b4325cc4699024::t_e82d7e5d9f2fe2 50
+  s_b4325cc4699024::t_9b3da5666cb6e1 33-35
+  s_b4325cc4699024::t_b53dce861f4003 67,90-99,106-112,124-144
+src/openharness/memory/search.py
+  s_b4325cc4699024::t_c75de8e8c52b0d 20-21,27-31,38
+ohmo/gateway/runtime.py
+  s_b4325cc4699024::t_f1c7005c9f2720 37-42
+  s_b4325cc4699024::t_8af73ebff62e8c 764,767-768,773,778,780-793
+  s_b4325cc4699024::t_6796b4a5b9a2af 130,139
+  s_b4325cc4699024::t_0a0f0dd007dcf4 868-873
+  s_b4325cc4699024::t_e6627a1f9b8830 83-84,89-95
+tests/test_ohmo/test_gateway.py
+  s_b4325cc4699024::t_37da2040a9fffb 6
+  s_b4325cc4699024::t_64b134f3318f58 56
+  s_b4325cc4699024::t_574c06d976c63d 20
+  s_b4325cc4699024::t_62142cd76a7936 3744-3746
+  s_b4325cc4699024::t_3bdb15fb9a8649 43-50
+  s_b4325cc4699024::t_5c8b561cbc09ea 68-73
+  s_b4325cc4699024::t_a221b7d16ede07 3678-3743,3747-4001
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.7",
+  "base_commit_sha": "affff73ac0d1e391cc272016932965808e29a2b8",
+  "prompts": {},
+  "sessions": {
+    "s_b4325cc4699024": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b4ad383c-9b97-44b8-9215-87896cb50d3a",
+        "model": "unknown"
+      },
+      "human_author": "zhenglixin.11 <zhenglixin.11@jd.com>"
+    }
+  }
+}
