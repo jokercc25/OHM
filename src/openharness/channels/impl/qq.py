@@ -25,7 +25,7 @@ from openharness.channels.impl.qq_rich import (
 )
 from openharness.config.schema import QQConfig
 from openharness.utils.fs import atomic_write_text
-from openharness.utils.helpers import image_extension_for, sniff_image_type
+from openharness.utils.helpers import image_extension_for, sniff_image_type, split_message
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,12 @@ MAX_IMAGES_PER_MESSAGE = 6
 # 120 MiB of raw bytes -- far past the limit -- so the per-file bound alone does
 # not bound anything.
 MAX_TOTAL_MEDIA_BYTES = 24 * 1024 * 1024
+
+# QQ rejects a single text message longer than 2000 characters (error 40054007)
+# rather than truncating it, so anything longer has to go out as several
+# messages. Nothing splits before this point, which meant one long reply was
+# simply lost with an error in the log.
+QQ_MAX_MESSAGE_LEN = 2000
 
 
 def _install_botpy_payload_hook() -> None:
@@ -257,34 +263,63 @@ class QQChannel(BaseChannel):
         logger.info("QQ bot stopped")
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through QQ (C2C or group)."""
+        """Send a message through QQ (C2C or group).
+
+        A message over ``QQ_MAX_MESSAGE_LEN`` is split rather than sent: QQ
+        rejects the whole thing otherwise, and a caller that composed a long
+        reply -- a verbatim archive dump, say -- has already decided the content
+        matters. ``_msg_seq`` increments per chunk, which is also what stops the
+        platform from de-duplicating them into one.
+        """
         if not self._client:
             logger.warning("QQ client not initialized")
             return
-        try:
+
+        chunks = split_message(msg.content or "", QQ_MAX_MESSAGE_LEN)
+        if not chunks:
+            logger.warning("QQ channel asked to send an empty message chat_id=%s", msg.chat_id)
+            return
+        if msg.media:
+            # Group image upload takes a public URL and botpy exposes no byte
+            # upload for groups, so an attachment cannot be delivered here.
+            # Logged rather than silent because the sender believes it went.
+            logger.warning(
+                "QQ channel cannot send attachments, dropped count=%s chat_id=%s",
+                len(msg.media),
+                msg.chat_id,
+            )
+
+        msg_id = msg.metadata.get("message_id")
+        is_group = msg.chat_id in self._group_openids
+        # Group replies are passive: must attach the msg_id of the @-message we
+        # are responding to.
+        group_msg_id = msg_id or self._group_msg_ids.get(msg.chat_id)
+
+        for chunk in chunks:
             self._msg_seq += 1  # 递增序列号
-            msg_id = msg.metadata.get("message_id")
-            if msg.chat_id in self._group_openids:
-                # Group replies are passive: must attach the msg_id of the
-                # @-message we are responding to.
-                group_msg_id = msg_id or self._group_msg_ids.get(msg.chat_id)
-                await self._client.api.post_group_message(
-                    group_openid=msg.chat_id,
-                    msg_type=0,
-                    content=msg.content,
-                    msg_id=group_msg_id,
-                    msg_seq=self._msg_seq,
-                )
-            else:
-                await self._client.api.post_c2c_message(
-                    openid=msg.chat_id,
-                    msg_type=0,
-                    content=msg.content,
-                    msg_id=msg_id,
-                    msg_seq=self._msg_seq,  # 添加序列号避免去重
-                )
-        except Exception as e:
-            logger.error("Error sending QQ message: %s", e)
+            try:
+                if is_group:
+                    await self._client.api.post_group_message(
+                        group_openid=msg.chat_id,
+                        msg_type=0,
+                        content=chunk,
+                        msg_id=group_msg_id,
+                        msg_seq=self._msg_seq,
+                    )
+                else:
+                    await self._client.api.post_c2c_message(
+                        openid=msg.chat_id,
+                        msg_type=0,
+                        content=chunk,
+                        msg_id=msg_id,
+                        msg_seq=self._msg_seq,  # 添加序列号避免去重
+                    )
+            except Exception as e:
+                # Stop rather than plough on: the usual cause is the five-reply
+                # budget for one inbound message, which fails every later chunk
+                # too, so continuing only buys noise.
+                logger.error("Error sending QQ message: %s", e)
+                return
 
     def _http_client(self) -> httpx.AsyncClient:
         if self._http is None:
