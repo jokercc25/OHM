@@ -1158,16 +1158,16 @@ def _should_retry_without_image_input(error_message: str, messages: list[Convers
     if not _history_has_image_blocks(messages):
         return False
     normalized = error_message.lower()
-    image_signal = any(
-        phrase in normalized
-        for phrase in (
-            "image input",
-            "image_url",
-            "multimodal",
-            "vision",
-            "image content",
-        )
-    )
+    # Bare "image", not "image input": providers word this differently, and
+    # DeepSeek reports an unsupported attachment as
+    # ".messages[24].image[0]: You have uploaded an unsupported image" -- which
+    # matched no phrase in the old list, so this returned False, the retry never
+    # fired, and the rejected image stayed in the history and failed every later
+    # turn too. The rejection phrase and _history_has_image_blocks checks below
+    # are what hold this back from firing spuriously; the cost of one false
+    # positive is a single turn with the images dropped, while the cost of a
+    # miss is a conversation that can no longer answer at all.
+    image_signal = "image" in normalized or "multimodal" in normalized or "vision" in normalized
     rejection_signal = any(
         phrase in normalized
         for phrase in (

@@ -25,6 +25,7 @@ from openharness.channels.impl.qq_rich import (
 )
 from openharness.config.schema import QQConfig
 from openharness.utils.fs import atomic_write_text
+from openharness.utils.helpers import image_extension_for, sniff_image_type
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,12 @@ _RECONNECT_MAX_SECONDS = 300
 MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_IMAGES_PER_MESSAGE = 6
+# Per-message budget across all images, not per file. Every image is inlined as
+# base64 into one request body, and providers cap that body (DeepSeek: 48 MiB,
+# with a 32 MiB ceiling per image). Six images at the per-file cap would be
+# 120 MiB of raw bytes -- far past the limit -- so the per-file bound alone does
+# not bound anything.
+MAX_TOTAL_MEDIA_BYTES = 24 * 1024 * 1024
 
 
 def _install_botpy_payload_hook() -> None:
@@ -294,24 +301,68 @@ class QQChannel(BaseChannel):
         now or never -- the URL is deliberately never persisted. Every failure
         is swallowed into a log line: a member forwarding an image must not
         lose the rest of the message because the CDN was slow.
+
+        Bytes are sniffed before anything is written. A CDN that answers with an
+        HTML error page -- or with an image in a format the vision providers do
+        not accept -- must not land on disk under a ``.jpg`` name: the file is
+        inlined into the request on this turn and, because the block is
+        persisted, on every later turn too. One bad file written here is a
+        conversation the provider rejects forever after.
         """
         if not refs:
             return {}
         media_dir = resolve_channel_media_dir(self.name)
         saved: dict[str, str] = {}
+        total_bytes = 0
+        rejected_format = 0
+        rejected_budget = 0
         for index, ref in enumerate(refs[:MAX_IMAGES_PER_MESSAGE], start=1):
-            target = media_dir / safe_attachment_name(message_id, index, ref.filename)
             try:
                 response = await self._http_client().get(ref.url)
                 response.raise_for_status()
-                if len(response.content) > MAX_ATTACHMENT_BYTES:
+                content = response.content
+                if len(content) > MAX_ATTACHMENT_BYTES:
                     logger.warning(
                         "QQ attachment over the size cap, skipped bytes=%s message_id=%s",
-                        len(response.content),
+                        len(content),
                         message_id,
                     )
                     continue
-                target.write_bytes(response.content)
+                media_type = sniff_image_type(content)
+                if media_type is None:
+                    rejected_format += 1
+                    # What the CDN *claimed* plus the first bytes of what it
+                    # actually sent -- that pair is what identifies the cause
+                    # (an HTML error page, a truncated body, a format the
+                    # providers reject) without a packet capture.
+                    headers = getattr(response, "headers", None)
+                    declared = headers.get("content-type") if hasattr(headers, "get") else None
+                    logger.warning(
+                        "QQ attachment is not a supported image, skipped bytes=%s "
+                        "content_type=%r head=%s message_id=%s",
+                        len(content),
+                        declared,
+                        content[:16].hex(),
+                        message_id,
+                    )
+                    continue
+                if total_bytes + len(content) > MAX_TOTAL_MEDIA_BYTES:
+                    rejected_budget += 1
+                    logger.warning(
+                        "QQ attachment over the message budget, skipped bytes=%s kept=%s "
+                        "message_id=%s",
+                        len(content),
+                        total_bytes,
+                        message_id,
+                    )
+                    continue
+                # Name the file after the sniffed format rather than after what
+                # QQ called it: the extension is what drives the media type on
+                # the way back out, so an honest one keeps that truthful.
+                stem = Path(safe_attachment_name(message_id, index, ref.filename)).stem
+                target = media_dir / f"{stem}{image_extension_for(media_type)}"
+                target.write_bytes(content)
+                total_bytes += len(content)
                 saved[ref.url] = str(target)
             except Exception as e:
                 logger.warning("QQ attachment download failed message_id=%s error=%s", message_id, e)
@@ -320,6 +371,15 @@ class QQChannel(BaseChannel):
                 "QQ message carried %s images, only the first %s were kept message_id=%s",
                 len(refs),
                 MAX_IMAGES_PER_MESSAGE,
+                message_id,
+            )
+        if rejected_format or rejected_budget:
+            logger.warning(
+                "QQ message kept %s of %s images (unsupported_format=%s over_budget=%s) message_id=%s",
+                len(saved),
+                len(refs),
+                rejected_format,
+                rejected_budget,
                 message_id,
             )
         return saved

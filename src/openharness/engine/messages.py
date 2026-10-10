@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
-import mimetypes
 from pathlib import Path
 from typing import Any, Annotated, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
+
+from openharness.utils.helpers import sniff_image_type
 
 
 class TextBlock(BaseModel):
@@ -28,12 +29,21 @@ class ImageBlock(BaseModel):
 
     @classmethod
     def from_path(cls, path: str | Path) -> "ImageBlock":
-        """Load a local image file into a base64-backed content block."""
+        """Load a local image file into a base64-backed content block.
+
+        The media type comes from the file's own bytes, not its extension. A
+        channel that saved a CDN error page under ``a.jpg`` would otherwise
+        hand the provider a block that says ``image/jpeg`` and holds HTML --
+        which the provider rejects, and because the block is persisted into the
+        session snapshot it would keep rejecting it on every later turn too.
+        Raising here keeps the bad bytes out of the conversation history.
+        """
         resolved = Path(path).expanduser().resolve()
-        media_type, _ = mimetypes.guess_type(str(resolved))
-        if not media_type or not media_type.startswith("image/"):
+        raw = resolved.read_bytes()
+        media_type = sniff_image_type(raw)
+        if media_type is None:
             raise ValueError(f"Unsupported image attachment: {resolved}")
-        payload = base64.b64encode(resolved.read_bytes()).decode("ascii")
+        payload = base64.b64encode(raw).decode("ascii")
         return cls(media_type=media_type, data=payload, source_path=str(resolved))
 
 

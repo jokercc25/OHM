@@ -48,6 +48,7 @@ from ohmo.gateway.runtime import (
     _format_channel_progress,
     _sanitize_group_command_metadata,
     _sanitize_group_command_prompts,
+    _should_retry_without_image_input,
 )
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, start_gateway_process, stop_gateway_process
 from ohmo.group_registry import load_managed_group_record, save_managed_group_record
@@ -1685,6 +1686,65 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
     assert f"image: example.png (path: {image_path})" in text
     assert f"file: report.txt (path: {report_path})" in text
     assert "text preview: Quarterly summary Revenue up 12%" in text
+
+
+def _history_with_image() -> list[ConversationMessage]:
+    return [
+        ConversationMessage(role="user", content=[TextBlock(text="看看这个图")]),
+        ConversationMessage(
+            role="user",
+            content=[ImageBlock(media_type="image/png", data="aGk=")],
+        ),
+    ]
+
+
+def _history_without_image() -> list[ConversationMessage]:
+    return [ConversationMessage(role="user", content=[TextBlock(text="看看这个图")])]
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        # DeepSeek, verbatim. The phrasing is what the old word list missed:
+        # it spells the problem "unsupported image" with an ".image[0]" pointer
+        # and never says "image input", so the retry never fired and the
+        # rejected image stayed in the history, failing every later turn too.
+        (
+            "API error: Error code: 400 - {'error': {'message': "
+            "'.messages[24].image[0]: You have uploaded an unsupported image. "
+            "Please make sure your image is valid and try again.'}}"
+        ),
+        # OpenRouter's wording, which the retry was originally written for.
+        (
+            "API error: Error code: 404 - {'error': {'message': "
+            "'No endpoints found that support image input', 'code': 404}}"
+        ),
+        "Error code: 400 - this model does not support vision",
+        "Error code: 400 - multimodal input is not supported",
+    ],
+)
+def test_image_rejection_is_recognised_whatever_the_provider_calls_it(error_message: str):
+    assert _should_retry_without_image_input(error_message, _history_with_image()) is True
+
+
+def test_image_rejection_needs_an_image_in_the_history():
+    """Without images there is nothing to strip, so the retry must not fire."""
+    deepseek = "Error code: 400 - You have uploaded an unsupported image."
+
+    assert _should_retry_without_image_input(deepseek, _history_without_image()) is False
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "Error code: 400 - unsupported tool: ohmo_save_gossip",
+        "Error code: 400 - model does not support tool use",
+        "Error code: 429 - rate limit exceeded",
+    ],
+)
+def test_unrelated_rejections_do_not_trip_the_image_retry(error_message: str):
+    """The rejection phrase is what keeps the widened signal from firing wildly."""
+    assert _should_retry_without_image_input(error_message, _history_with_image()) is False
 
 
 @pytest.mark.asyncio

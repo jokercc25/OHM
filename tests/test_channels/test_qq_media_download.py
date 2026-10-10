@@ -21,10 +21,32 @@ from openharness.config.schema import QQConfig
 _LOGGER = "openharness.channels.impl.qq"
 _URL = "https://multimedia.nt.qq.com.cn/download?fileid=ABC&rkey=SECRET"
 
+# A 1x1 PNG. Real magic bytes on purpose: the channel now refuses to write
+# anything it cannot identify as an image from the bytes alone, so the
+# stand-in text these tests used to use would simply be skipped.
+_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n"
+    b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+    b"\x90wS\xde\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01"
+    b"\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+# RIFF....WEBP -- a valid image whose declared filename says otherwise.
+_WEBP_BYTES = b"RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00" + b"\x00" * 24
+
+# What a stale ``rkey`` actually returns: HTTP 200 with an HTML body.
+_HTML_BYTES = b"<!DOCTYPE html><html><body>404</body></html>"
+
 
 class _Response:
-    def __init__(self, content: bytes, status_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        content: bytes,
+        status_error: Exception | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.content = content
+        self.headers = headers or {}
         self._status_error = status_error
 
     def raise_for_status(self) -> None:
@@ -60,21 +82,51 @@ def _channel(http: _StubHttp) -> QQChannel:
 
 @pytest.mark.asyncio
 async def test_download_writes_the_file_and_maps_the_url(_media_root):
-    http = _StubHttp({_URL: _Response(b"jpeg-bytes")})
+    http = _StubHttp({_URL: _Response(_PNG_BYTES)})
     channel = _channel(http)
 
     saved = await channel._download_media("MSG1", (MediaRef(url=_URL, filename="a.jpg"),))
 
-    path = _media_root / "MSG1_1_a.jpg"
+    path = _media_root / "MSG1_1_a.png"
     assert saved == {_URL: str(path)}
-    assert path.read_bytes() == b"jpeg-bytes"
+    assert path.read_bytes() == _PNG_BYTES
+
+
+@pytest.mark.asyncio
+async def test_saved_extension_follows_the_bytes_not_the_filename(_media_root):
+    """QQ called it a .jpg; the bytes are a WebP, and that is what is stored."""
+    http = _StubHttp({_URL: _Response(_WEBP_BYTES)})
+    channel = _channel(http)
+
+    saved = await channel._download_media("MSG1", (MediaRef(url=_URL, filename="a.jpg"),))
+
+    path = _media_root / "MSG1_1_a.webp"
+    assert saved == {_URL: str(path)}
+    assert not (_media_root / "MSG1_1_a.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_non_image_body_is_never_written(_media_root, caplog):
+    """An expired rkey answers 200 with HTML. Writing it would poison the turn."""
+    http = _StubHttp({_URL: _Response(_HTML_BYTES, headers={"content-type": "text/html"})})
+    channel = _channel(http)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        saved = await channel._download_media("MSG1", (MediaRef(url=_URL, filename="a.jpg"),))
+
+    assert saved == {}
+    assert not (_media_root / "MSG1_1_a.jpg").exists()
+    assert not (_media_root / "MSG1_1_a.png").exists()
+    assert "not a supported image" in caplog.text
+    # The log has to identify the cause without a packet capture.
+    assert "text/html" in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_one_failed_image_does_not_lose_the_others(_media_root, caplog):
     ok = _URL + "-ok"
     bad = _URL + "-bad"
-    http = _StubHttp({ok: _Response(b"a"), bad: RuntimeError("connection reset")})
+    http = _StubHttp({ok: _Response(_PNG_BYTES), bad: RuntimeError("connection reset")})
     channel = _channel(http)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -85,6 +137,25 @@ async def test_one_failed_image_does_not_lose_the_others(_media_root, caplog):
 
     assert list(saved) == [ok]
     assert "download failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_total_budget_caps_across_images_not_per_file(_media_root, caplog, monkeypatch):
+    monkeypatch.setattr(qq_module, "MAX_TOTAL_MEDIA_BYTES", len(_PNG_BYTES) + 1)
+    first = _URL + "-1"
+    second = _URL + "-2"
+    http = _StubHttp({first: _Response(_PNG_BYTES), second: _Response(_PNG_BYTES)})
+    channel = _channel(http)
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        saved = await channel._download_media(
+            "MSG1",
+            (MediaRef(url=first, filename="1.png"), MediaRef(url=second, filename="2.png")),
+        )
+
+    # Each file is far under MAX_ATTACHMENT_BYTES; only their sum breaks the cap.
+    assert list(saved) == [first]
+    assert "over the message budget" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -117,7 +188,7 @@ async def test_oversized_attachments_are_skipped(_media_root, caplog, monkeypatc
 async def test_only_the_first_images_are_fetched(_media_root, caplog, monkeypatch):
     monkeypatch.setattr(qq_module, "MAX_IMAGES_PER_MESSAGE", 2)
     urls = [f"{_URL}-{index}" for index in range(5)]
-    http = _StubHttp({url: _Response(b"x") for url in urls})
+    http = _StubHttp({url: _Response(_PNG_BYTES) for url in urls})
     channel = _channel(http)
 
     with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -167,7 +238,7 @@ class _FakeMessage:
 
 @pytest.mark.asyncio
 async def test_group_message_carries_local_paths_instead_of_expiring_urls(_media_root):
-    http = _StubHttp({_URL: _Response(b"jpeg-bytes")})
+    http = _StubHttp({_URL: _Response(_PNG_BYTES)})
     bus = MessageBus()
     channel = QQChannel(QQConfig(app_id="1", app_secret="s", allow_from=["*"]), bus)
     channel._http = http
@@ -184,7 +255,7 @@ async def test_group_message_carries_local_paths_instead_of_expiring_urls(_media
     )
 
     inbound = await bus.consume_inbound()
-    path = str(_media_root / "MSG1_1_a.jpg")
+    path = str(_media_root / "MSG1_1_a.png")
     assert inbound.media == [path]
     assert path in inbound.content
     # The rkey dies within minutes; it must not reach the model or the archive.
